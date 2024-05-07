@@ -1,0 +1,159 @@
+diff --git a/setup.py b/setup.py
+index 38305dc1..70adf637 100644
+--- a/setup.py
++++ b/setup.py
+@@ -5,13 +5,16 @@ import os
+ import re
+ import subprocess
+ import sys
++from pathlib import Path
+ from shutil import which
+ from typing import Dict, List
+ 
+ import torch
++from Cython.Build import cythonize
+ from packaging.version import Version, parse
+ from setuptools import Extension, find_packages, setup
+ from setuptools.command.build_ext import build_ext
++from setuptools.command.build_py import build_py
+ from torch.utils.cpp_extension import CUDA_HOME
+ 
+ 
+@@ -189,6 +192,10 @@ class cmake_build_ext(build_ext):
+ 
+         # Build all the extensions
+         for ext in self.extensions:
++            if (type(ext) == Extension):
++                super().build_extensions()
++                continue
++
+             self.configure(ext)
+ 
+             ext_target_name = remove_prefix(ext.name, "taco_llm.")
+@@ -377,6 +384,79 @@ def get_requirements() -> List[str]:
+     return requirements
+ 
+ 
++def get_ext_paths(
++    root_dir: str,
++    ext: str = ".py",
++    exclude_files: List[str] = list(),
++    keep_relative: bool = False,
++) -> List[str]:
++    """
++    Get file paths for cython compilation.
++    """
++    paths = list()
++    exclude_files = [Path(p) for p in exclude_files]
++
++    for root, _, files in os.walk(root_dir, followlinks=True):
++        for file in files:
++            path = root / Path(file)
++            if path.suffix == ext and not any(
++                    path.samefile(f) for f in exclude_files):
++                if keep_relative:
++                    paths.append(str(path))
++                else:
++                    paths.append(str(path.resolve()))
++    return paths
++
++
++def get_cythonize_files(cython_excludes: List[str]) -> List[str]:
++    cythonize_files = get_ext_paths("taco_llm", exclude_files=cython_excludes)
++    return cythonize_files
++
++
++cython_excludes = [
++    "taco_llm/engine/llm_engine.py",
++    "taco_llm/engine/metrics.py",
++    "taco_llm/executor/ray_utils.py",
++    "taco_llm/entrypoints/api_server.py",
++    "taco_llm/entrypoints/openai/protocol.py",
++    "taco_llm/entrypoints/openai/api_server.py",
++    "taco_llm/model_executor/layers/quantization/base_config.py",
++    "taco_llm/attention/ops/prefix_prefill.py",
++    "taco_llm/model_executor/layers/fused_moe/fused_moe.py",
++    "taco_llm/model_executor/layers/rejection_sampler.py",
++    "taco_llm/sequence.py",
++    "taco_llm/distributed/communication_op.py",
++]
++to_cythonize = get_cythonize_files(cython_excludes)
++
++
++class BuildPyOverride(build_py):  # type: ignore
++    """
++    Class used for python file packaging.
++    """
++
++    def find_modules(self) -> List:
++        modules = super().find_modules()
++        # Filter out all files built with cython
++        return [(pkg, mod, file) for pkg, mod, file in modules if not any(
++            Path(file).samefile(Path(py_path)) for py_path in to_cythonize)]
++
++    def find_package_modules(self, package: str, package_dir: str) -> List:
++        modules = super().find_package_modules(package, package_dir)
++        # Filter out all files built with cython
++        return [(
++            pkg,
++            mod,
++            file,
++        ) for pkg, mod, file in modules if not any(
++            Path(file).samefile(Path(py_path)) for py_path in to_cythonize)]
++
++
++if "MAX_JOBS" not in os.environ:
++    # limit max jobs to 8 to avoid oom.
++    jobs = min(os.cpu_count(), 8)
++    os.environ["MAX_JOBS"] = str(jobs)
++
+ ext_modules = []
+ 
+ if _is_cuda():
+@@ -389,12 +469,28 @@ if not _is_neuron():
+     ext_modules.append(CMakeExtension(name="taco_llm._C"))
+ 
+ package_data = {
+-    "taco_llm": ["py.typed", "model_executor/layers/fused_moe/configs/*.json"]
++    "taco_llm": [
++        "benchmark/*.html", "model_executor/layers/fused_moe/configs/*.json",
++        "py.typed"
++    ]
+ }
+ if envs.VLLM_USE_PRECOMPILED:
+     ext_modules = []
+     package_data["taco_llm"].append("*.so")
+ 
++cython_export=cythonize(
++        module_list=to_cythonize,
++        exclude=cython_excludes,
++        compiler_directives={"language_level": 3},
++        build_dir="build",
++        nthreads=16,
++    )
++cython_lists = []
++for cython_file in cython_export:
++    setattr(cython_file, "cmake_lists_dir", ".")
++    cython_lists.append(cython_file)
++
++
+ setup(
+     name="taco-llm",
+     version=get_taco_llm_version(),
+@@ -427,10 +523,14 @@ setup(
+                                     "tests*")),
+     python_requires=">=3.8",
+     install_requires=get_requirements(),
+-    ext_modules=ext_modules,
++    ext_modules=cython_lists + ext_modules,
++    exclude=cython_excludes,
+     extras_require={
+         "tensorizer": ["tensorizer==2.9.0"],
+     },
+-    cmdclass={"build_ext": cmake_build_ext} if not _is_neuron() else {},
++    cmdclass={
++        "build_py": BuildPyOverride,
++        "build_ext": cmake_build_ext,
++    } if not _is_neuron() else {"build_py": BuildPyOverride},
+     package_data=package_data,
+ )
