@@ -1,0 +1,6 @@
+{
+  "cache_mode": 2,
+  "token_paths_top_k":2,
+  "is_debug": true,
+  "log_interval": 200
+}
