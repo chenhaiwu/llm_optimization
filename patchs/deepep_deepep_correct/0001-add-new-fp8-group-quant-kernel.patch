@@ -1,0 +1,88 @@
+From c37367f88f4ba9c67731b376a030f3b0883b0807 Mon Sep 17 00:00:00 2001
+From: lionthu <lionthu@tencent.com>
+Date: Mon, 7 Apr 2025 19:32:51 +0800
+Subject: [PATCH 1/2] add new fp8 group quant kernel.
+
+Signed-off-by: haiwuchen <haiwuchen@tencent.com>
+---
+ vllm/_custom_ops.py                           | 33 +++++++++++++++++++
+ .../layers/fused_moe/deep_gemm_moe.py         |  7 ++--
+ 2 files changed, 38 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/_custom_ops.py b/vllm/_custom_ops.py
+index d68c097fb..a33d3c9ad 100644
+--- a/vllm/_custom_ops.py
++++ b/vllm/_custom_ops.py
+@@ -1366,3 +1366,36 @@ def flash_mla_with_kvcache(
+         num_splits,
+     )
+     return out, softmax_lse
++
++
++def sglang_per_token_group_quant_fp8(
++    x: torch.Tensor,
++    group_size: int,
++    eps: float = 1e-10,
++    dtype: Optional[torch.dtype] = None,
++):
++    from sgl_kernel import sgl_per_token_group_quant_fp8
++
++    dtype = current_platform.fp8_dtype() if dtype is None else dtype
++    assert (x.shape[-1] % group_size == 0), (
++        f"the last dimension of `x` {x.shape[-1]} must be divisible "
++        f"by `group_size` {group_size}")
++    assert x.stride(-1) == 1, "`x` groups must be contiguous"
++
++    finfo = torch.finfo(dtype)
++    fp8_max = finfo.max
++
++    fp8_min = -fp8_max
++
++    x_q = torch.empty_like(x, device=x.device, dtype=dtype)
++    M = x.numel() // group_size
++    N = group_size
++    x_s = torch.empty(
++        x.shape[:-1] + (x.shape[-1] // group_size,),
++        device=x.device,
++        dtype=torch.float32,
++    )
++
++    sgl_per_token_group_quant_fp8(x, x_q, x_s, group_size, eps, fp8_min, fp8_max)
++
++    return x_q, x_s
+\ No newline at end of file
+diff --git a/vllm/model_executor/layers/fused_moe/deep_gemm_moe.py b/vllm/model_executor/layers/fused_moe/deep_gemm_moe.py
+index be770d88c..6a50e33b6 100644
+--- a/vllm/model_executor/layers/fused_moe/deep_gemm_moe.py
++++ b/vllm/model_executor/layers/fused_moe/deep_gemm_moe.py
+@@ -2,6 +2,7 @@ import torch
+ 
+ import deep_gemm as dg
+ import vllm.envs as envs
++import vllm._custom_ops as ops
+ from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8
+ 
+ 
+@@ -58,7 +59,8 @@ def deep_gemm_grouped_gemm_contiguous(
+     # We execute the fused_moe kernel in chunks to circumvent this issue:
+     # https://github.com/vllm-project/vllm/issues/5938
+     # a, a_s = per_token_group_quant_fp8(hidden_states, block_k)
+-    a, a_s = chunked_per_token_group_quant_fp8(hidden_states, block_k)
++    # a, a_s = chunked_per_token_group_quant_fp8(hidden_states, block_k)
++    a, a_s = ops.sglang_per_token_group_quant_fp8(hidden_states, block_k)
+ 
+     a_s = dg.get_col_major_tma_aligned_tensor(a_s)
+ 
+@@ -90,7 +92,8 @@ def deep_gemm_grouped_gemm_masked(
+     # We execute the fused_moe kernel in chunks to circumvent this issue:
+     # https://github.com/vllm-project/vllm/issues/5938
+     # a, a_s = per_token_group_quant_fp8(hidden_states.view(-1, hidden_dim), block_k)
+-    a, a_s = chunked_per_token_group_quant_fp8(hidden_states.view(-1, hidden_dim), block_k)
++    # a, a_s = chunked_per_token_group_quant_fp8(hidden_states.view(-1, hidden_dim), block_k)
++    a, a_s = ops.sglang_per_token_group_quant_fp8(hidden_states.view(-1, hidden_dim), block_k)
+     a = a.view(E, M, hidden_dim)
+     a_s = a_s.view(E, M, hidden_dim // block_k)
+ 
+-- 
+2.34.1
+

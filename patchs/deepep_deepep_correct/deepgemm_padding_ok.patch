@@ -1,0 +1,1008 @@
+diff --git a/vllm/model_executor/layers/fused_moe/__init__.py b/vllm/model_executor/layers/fused_moe/__init__.py
+index 1f9a7b2ce..c20df9f91 100644
+--- a/vllm/model_executor/layers/fused_moe/__init__.py
++++ b/vllm/model_executor/layers/fused_moe/__init__.py
+@@ -4,7 +4,7 @@ from contextlib import contextmanager
+ from typing import Any, Dict, Optional
+ 
+ from vllm.model_executor.layers.fused_moe.layer import (
+-    FusedMoE, DeepEPMoE, FusedMoEMethodBase, FusedMoeWeightScaleSupported)
++    FusedMoE, GroupedGemmRunner, DeepEPMoE, FusedMoEMethodBase, FusedMoeWeightScaleSupported)
+ from vllm.triton_utils import HAS_TRITON
+ 
+ _config: Optional[Dict[str, Any]] = None
+@@ -25,6 +25,7 @@ def get_config() -> Optional[Dict[str, Any]]:
+ 
+ __all__ = [
+     "FusedMoE",
++    "GroupedGemmRunner",
+     "DeepEPMoE",
+     "FusedMoEMethodBase",
+     "FusedMoeWeightScaleSupported",
+diff --git a/vllm/model_executor/layers/fused_moe/deep_gemm_moe.py b/vllm/model_executor/layers/fused_moe/deep_gemm_moe.py
+index 6a50e33b6..8a2eaad69 100644
+--- a/vllm/model_executor/layers/fused_moe/deep_gemm_moe.py
++++ b/vllm/model_executor/layers/fused_moe/deep_gemm_moe.py
+@@ -4,6 +4,7 @@ import deep_gemm as dg
+ import vllm.envs as envs
+ import vllm._custom_ops as ops
+ from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8
++import numpy as np
+ 
+ 
+ def get_m_indices(
+@@ -108,9 +109,16 @@ def deep_gemm_grouped_gemm_masked(
+     )
+ 
+ 
++def dedup_numpy(lst):
++    arr = np.array(lst)
++    unique_values, first_indices = np.unique(arr, return_index=True)
++    return unique_values.tolist(), first_indices.tolist()
++
++
+ def deep_gemm_prefill_moe(
+     hidden_states: torch.Tensor,
+     num_tokens_per_expert: torch.Tensor,
++    valid_indices: torch.Tensor,
+     w1: torch.Tensor,
+     w1_s: torch.Tensor,
+     w2: torch.Tensor,
+@@ -120,7 +128,53 @@ def deep_gemm_prefill_moe(
+     activation: str = "silu",
+ ) -> torch.Tensor:                       # [E, M, H]
+     EM = hidden_states.shape[0]
++    ORI_EM = EM
++    ori_hidden_states = hidden_states
++    ori_valid_indices = valid_indices
++    
+     N = w1.shape[1]
++    
++    # EM_PADDING = (EM + 127) // 128 * 128
++    # padded_output = output
++    
++    # num_experts = len(valid_indices) # [51, 19]
++    # EM_PADDING = 128 * num_experts
++    # padded_hidden_states = torch.zeros([EM_PADDING, hidden_states.shape[1]], dtype=hidden_states.dtype, device=hidden_states.device)
++    # padded_valid_indices = torch.zeros([EM_PADDING], dtype=valid_indices.dtype, device=valid_indices.device)
++    
++    start_idx = 0
++    start_idx_2 = 0
++    finanl_hidden_stats = []
++    finanl_select_idx = []
++    
++    for cur_expert_token_nums in num_tokens_per_expert.tolist():
++        EM_PADDING = (cur_expert_token_nums + 127) // 128 * 128
++        
++        padded_hidden_states = torch.zeros([EM_PADDING, hidden_states.shape[1]], dtype=hidden_states.dtype, device=hidden_states.device)        
++        padded_hidden_states[:cur_expert_token_nums] = hidden_states[start_idx:start_idx+cur_expert_token_nums]
++        finanl_hidden_stats.append(padded_hidden_states)
++
++        select_idx = torch.arange(cur_expert_token_nums, device=hidden_states.device) + start_idx_2
++        finanl_select_idx.append(select_idx)
++        start_idx += cur_expert_token_nums
++        start_idx_2 += EM_PADDING
++    finanl_hidden_stats = torch.concat(finanl_hidden_stats, dim=0)
++    finanl_select_idx = torch.concat(finanl_select_idx, dim=0)
++    
++    finanl_num_tokens_per_expert = (num_tokens_per_expert + 127) // 128 * 128
++    padded_output = torch.empty_like(finanl_hidden_stats)
++    EM = padded_output.shape[0]
++    
++
++    # if EM_PADDING != EM:
++    #     padded_hidden_states = torch.zeros([EM_PADDING, hidden_states.shape[1]], dtype=hidden_states.dtype, device=hidden_states.device)
++    #     padded_hidden_states[:EM] = hidden_states
++    #     padded_output = torch.zeros([EM_PADDING, hidden_states.shape[1]], dtype=hidden_states.dtype, device=hidden_states.device)
++    #     padded_valid_indices = torch.zeros([EM_PADDING], dtype=valid_indices.dtype, device=valid_indices.device)
++    #     padded_valid_indices[:EM] = valid_indices
++    #     hidden_states = padded_hidden_states
++    #     valid_indices = padded_valid_indices
++    #     EM = EM_PADDING
+ 
+     intermediate_cache1 = torch.empty((EM, N),
+                           device=hidden_states.device,
+@@ -130,14 +184,16 @@ def deep_gemm_prefill_moe(
+                           device=hidden_states.device,
+                           dtype=hidden_states.dtype)
+ 
+-    m_indices = get_m_indices(num_tokens_per_expert)
++    m_indices = get_m_indices(finanl_num_tokens_per_expert)
++    valid_indices = m_indices
++    # valid_indices = valid_indices.to(dtype=torch.int32)
+ 
+     deep_gemm_grouped_gemm_contiguous(
+-        hidden_states,
++        finanl_hidden_stats,
+         w1,
+         w1_s,
+         intermediate_cache1,
+-        m_indices,
++        valid_indices,
+         block_k=block_k,
+     )
+ 
+@@ -152,11 +208,13 @@ def deep_gemm_prefill_moe(
+         intermediate_cache2,
+         w2,
+         w2_s,
+-        output,
+-        m_indices,
++        padded_output,
++        valid_indices,
+         block_k=block_k,
+     )
+ 
++    output = padded_output[finanl_select_idx]
++    assert output.shape[0] == ori_hidden_states.shape[0]
+     return output
+ 
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/layer.py b/vllm/model_executor/layers/fused_moe/layer.py
+index 9aea9a6f4..446d836c1 100644
+--- a/vllm/model_executor/layers/fused_moe/layer.py
++++ b/vllm/model_executor/layers/fused_moe/layer.py
+@@ -22,6 +22,22 @@ from vllm.platforms import current_platform
+ from vllm.platforms.interface import CpuArchEnum
+ from vllm.utils import direct_register_custom_op
+ from vllm.model_executor.layers.fused_moe.expert_weight import ExpertWeightsPerLayer
++import triton
++import triton.language as tl
++
++from vllm.model_executor.layers.fused_moe.kernels import (grouped_gemm_triton, silu_and_mul_triton_kernel)
++import json, os
++
++
++class CustomData:
++    def __init__(self, tensor):
++        self.tensor = tensor
++
++def custom_serializer(obj):
++    if isinstance(obj, CustomData):
++        return {"tensor": obj.tensor.tolist()}
++    raise TypeError("Unsupported type")
++
+ 
+ if current_platform.is_cuda_alike():
+     from .fused_moe import fused_experts
+@@ -925,6 +941,70 @@ direct_register_custom_op(
+ )
+ 
+ 
++class GroupedGemmRunner(torch.nn.Module):
++    flashinfer_gemm_warpper = None
++
++    def __init__(self, device, use_flashinfer: bool = False):
++        super().__init__()
++        self.device = device
++        self.use_flashinfer = use_flashinfer
++        if self.use_flashinfer and GroupedGemmRunner.flashinfer_gemm_warpper is None:
++            GroupedGemmRunner._init_flashinfer_wrapper(device)
++
++    @classmethod
++    def _init_flashinfer_wrapper(cls, device):
++        from flashinfer import SegmentGEMMWrapper
++
++        workspace_buffer = torch.empty(
++            128 * 1024 * 1024, dtype=torch.int8, device=device
++        )
++        cls.flashinfer_gemm_warpper = SegmentGEMMWrapper(workspace_buffer)
++
++    # c = a * b
++    def forward(
++        self,
++        a: torch.Tensor,
++        b: torch.Tensor,
++        c: torch.Tensor,
++        batch_size: int,
++        weight_column_major: bool,
++        seg_indptr: Optional[torch.Tensor] = None,
++        weight_indices: Optional[torch.Tensor] = None,
++        use_fp8_w8a8: bool = False,
++        scale_a: torch.Tensor = None,
++        scale_b: torch.Tensor = None,
++        block_shape: Optional[List[int]] = None,
++    ):
++        if self.use_flashinfer:
++            # TODO: flashinfer
++            assert False
++            assert GroupedGemmRunner.flashinfer_gemm_warpper is not None
++            c = GroupedGemmRunner.flashinfer_gemm_warpper.run(
++                x=a,
++                weights=b,
++                batch_size=batch_size,
++                weight_column_major=weight_column_major,
++                seg_indptr=seg_indptr,
++                weight_indices=weight_indices,
++            )
++        else:
++            assert weight_column_major == True
++            c = grouped_gemm_triton(
++                a,
++                b,
++                c,
++                batch_size,
++                weight_column_major,
++                seg_indptr,
++                weight_indices,
++                use_fp8_w8a8,
++                scale_a,
++                scale_b,
++                block_shape=block_shape,
++            )
++        return c
++
++
+ class DeepEPMoE(FusedMoE):
+     """
+     MoE Expert Parallel Impl based on DeepEP (https://github.com/deepseek-ai/DeepEP/tree/main)
+@@ -975,27 +1055,221 @@ class DeepEPMoE(FusedMoE):
+             e_score_correction_bias,
+             activation,
+         )
++        self.grouped_gemm_runner = None
++        self.counter = 0
++        
++    def calc_diff(self, x, y):
++        x, y = x.double(), y.double()
++        denominator = (x * x + y * y).sum()
++        sim = 2 * (x * y).sum() / denominator
++        return 1 - sim
+ 
+     def forward(
+         self,
+         hidden_states: torch.Tensor,
+-        tokens_per_expert: torch.Tensor,
++        reorder_topk_ids: torch.Tensor,
++        seg_indptr: torch.Tensor,
+         is_prefill: bool,
++        tokens_per_expert: Optional[torch.Tensor],
+     ):
++    # def forward(
++    #     self,
++    #     hidden_states: torch.Tensor,
++    #     tokens_per_expert: torch.Tensor,
++    #     valid_indices: Optional[torch.Tensor],
++    #     is_prefill: bool,
++    # ):
+         if is_prefill:
+-            return self.forward_prefill(hidden_states, tokens_per_expert)
++            # return self.forward_prefill(hidden_states, tokens_per_expert, valid_indices)
++            # return self.forward_normal_sglang(hidden_states, reorder_topk_ids, seg_indptr) # work
++            # return self.forward_prefill_2(hidden_states, reorder_topk_ids, seg_indptr)
++            hidden_states_sglang = self.forward_normal_sglang(hidden_states, reorder_topk_ids, seg_indptr)
++            hidden_states_deepgemm = self.forward_prefill_2(hidden_states, reorder_topk_ids, seg_indptr, tokens_per_expert)
++
++            debug = False
++            local_rank = torch.distributed.get_rank()
++            self.counter += 1
++            # folder_1 = "seqs4"
++            # folder_2 = f"{self.counter:03d}"
++            # folder_name = [folder_1, folder_2, self.layer_name]
++            
++            # full_path = os.path.join("/data0/chw/logs", *folder_name)
++            # os.makedirs(full_path, exist_ok=True)
++            a = bool(
++                torch.all(torch.isclose(hidden_states_sglang, hidden_states_deepgemm)).item())
++            calc_diff = self.calc_diff(hidden_states_sglang, hidden_states_deepgemm)
++            b = calc_diff < 0.001
++            print(f"{local_rank=}: isclose:{a=} calc_diff:{b=} {calc_diff=} {hidden_states_sglang.shape[0]=}: {self.counter=}, {self.layer_name}")
++            
++            # assert diff < 0.001
++                
++            if debug and hidden_states_sglang.shape[0] < 2000:
++                # check isclose
++                # a = bool(
++                #     torch.all(torch.isclose(hidden_states_sglang, hidden_states_deepgemm)).item())
++                # print(f"a{a=}, {reorder_topk_ids.dtype=}")
++                # print(f"{hidden_states_sglang=}")
++                # print(f"{hidden_states_deepgemm=}")
++                # torch.isclose(hidden_states_sglang, hidden_states_deepgemm)
++
++                # dump data
++                data = CustomData(hidden_states_sglang.cpu())
++                file_name = "hidden_states_sglang_" + str(local_rank) + ".json"
++                file_path = os.path.join(full_path, file_name)
++                with open(file_path, "w") as f:
++                    json.dump(data, f, default=custom_serializer)
++                data = CustomData(hidden_states_deepgemm.cpu())
++                file_name = "hidden_states_deepgemm_" + str(local_rank) + ".json"
++                file_path = os.path.join(full_path, file_name)
++                with open(file_path, "w") as f:
++                    json.dump(data, f, default=custom_serializer)
++            return hidden_states_deepgemm
+         else:
+             return self.forward_decode(hidden_states, tokens_per_expert)
++        
++    def forward_normal_sglang(
++        self,
++        hidden_states: torch.Tensor,
++        reorder_topk_ids: torch.Tensor,
++        seg_indptr: torch.Tensor,
++    ):
++        assert self.quant_method is not None
++        assert self.activation == "silu"
++        if self.grouped_gemm_runner is None:
++            self.grouped_gemm_runner = GroupedGemmRunner(
++                hidden_states.device, use_flashinfer=False  # TODO: use flashinfer
++            )
+ 
+-    def forward_prefill(
++        # if self.activation_scheme == "dynamic" and not self.quant_method.block_quant:
++        #     max_value = (
++        #         torch.max(hidden_states)
++        #         .repeat(self.local_num_experts)
++        #         .to(torch.float32)
++        #     )
++        #     self.w13_input_scale = max_value / torch.finfo(self.fp8_dtype).max
++        weight_indices_cur_rank = torch.arange(
++            0,
++            self.local_num_experts,
++            device=hidden_states.device,
++            dtype=torch.int64,
++        )
++
++        # GroupGemm-0
++        gateup_output = torch.empty(
++            hidden_states.shape[0],
++            self.w13_weight.shape[1],
++            device=hidden_states.device,
++            dtype=hidden_states.dtype,
++        )
++
++        if hidden_states.shape[0] > 0:
++            gateup_output = self.grouped_gemm_runner(
++                a=hidden_states,
++                b=self.w13_weight,
++                c=gateup_output,
++                batch_size=self.local_num_experts,
++                weight_column_major=True,
++                seg_indptr=seg_indptr,
++                weight_indices=weight_indices_cur_rank,
++                use_fp8_w8a8=True,
++                scale_a=None,
++                scale_b=self.w13_weight_scale_inv,
++                block_shape=self.quant_method.quant_config.weight_block_size,
++            )
++
++        # Act
++        down_input = torch.empty(
++            gateup_output.shape[0],
++            gateup_output.shape[1] // 2,
++            device=gateup_output.device,
++            dtype=hidden_states.dtype,
++        )
++        if self.w2_input_scale is None and not self.quant_method.block_quant:
++            self.w2_input_scale = torch.ones(
++                self.local_num_experts,
++                dtype=torch.float32,
++                device=hidden_states.device,
++            )
++
++        if self.activation == "silu":
++            silu_and_mul_triton_kernel[(gateup_output.shape[0],)](
++                gateup_output,
++                down_input,
++                gateup_output.shape[1],
++                reorder_topk_ids,
++                self.w2_input_scale,
++                0,
++                self.local_num_experts - 1,
++                BLOCK_SIZE=512,
++            )
++        else:
++            raise ValueError(f"Unsupported activation: {self.activation=}")
++
++        # GroupGemm-1
++        down_output = torch.empty(
++            down_input.shape[0],
++            self.w2_weight.shape[1],
++            device=hidden_states.device,
++            dtype=hidden_states.dtype,
++        )
++        if down_input.shape[0] > 0:
++            down_output = self.grouped_gemm_runner(
++                a=down_input,
++                b=self.w2_weight,
++                c=down_output,
++                batch_size=self.local_num_experts,
++                weight_column_major=True,
++                seg_indptr=seg_indptr,
++                weight_indices=weight_indices_cur_rank,
++                use_fp8_w8a8=True,
++                scale_a=self.w2_input_scale,
++                scale_b=self.w2_weight_scale_inv,
++                block_shape=self.quant_method.quant_config.weight_block_size,
++            )
++        return down_output
++
++    def forward_prefill_2(
+         self,
+         hidden_states: torch.Tensor,
++        reorder_topk_ids: torch.Tensor,
++        seg_indptr: torch.Tensor,
+         tokens_per_expert: torch.Tensor,
+     ):
+         from vllm.model_executor.layers.fused_moe.deep_gemm_moe import deep_gemm_prefill_moe
+ 
+         assert self.quant_method is not None and self.quant_method.block_quant, "DeepGEMM only support block quant."
++        output = torch.empty(
++            hidden_states.shape[0],
++            self.w2_weight.shape[1],
++            device=hidden_states.device,
++            dtype=hidden_states.dtype,
++        )
+ 
++        if hidden_states.shape[0] > 0:
++            output = deep_gemm_prefill_moe(
++                hidden_states,
++                tokens_per_expert,
++                reorder_topk_ids,
++                self.w13_weight,
++                self.w13_weight_scale_inv,
++                self.w2_weight,
++                self.w2_weight_scale_inv,
++                output,
++                block_k=128,
++                activation=self.activation, 
++            )
++
++        return output
++
++    def forward_prefill(
++        self,
++        hidden_states: torch.Tensor,
++        tokens_per_expert: torch.Tensor,
++        valid_indices: Optional[torch.Tensor],
++    ):
++        from vllm.model_executor.layers.fused_moe.deep_gemm_moe import deep_gemm_prefill_moe
++
++        assert self.quant_method is not None and self.quant_method.block_quant, "DeepGEMM only support block quant."
+         output = torch.empty(
+             hidden_states.shape[0],
+             self.w2_weight.shape[1],
+@@ -1007,13 +1281,14 @@ class DeepEPMoE(FusedMoE):
+             output = deep_gemm_prefill_moe(
+                 hidden_states,
+                 tokens_per_expert,
++                valid_indices,
+                 self.w13_weight,
+                 self.w13_weight_scale_inv,
+                 self.w2_weight,
+                 self.w2_weight_scale_inv,
+                 output,
+                 block_k=128,
+-                activation=self.activation,
++                activation=self.activation, 
+             )
+ 
+         return output
+diff --git a/vllm/model_executor/layers/fused_moe/token_dispatcher.py b/vllm/model_executor/layers/fused_moe/token_dispatcher.py
+index 189aba692..838b8a9e3 100644
+--- a/vllm/model_executor/layers/fused_moe/token_dispatcher.py
++++ b/vllm/model_executor/layers/fused_moe/token_dispatcher.py
+@@ -10,7 +10,11 @@ from typing import Optional, Tuple
+ 
+ import torch
+ import torch.distributed as dist
+-
++from vllm.model_executor.layers.fused_moe.kernels import (
++    deepep_permute_triton_kernel,
++    deepep_post_reorder_triton_kernel,
++    deepep_run_moe_deep_preprocess,
++)
+ _buffer_normal = None
+ _buffer_low_latency = None
+ 
+@@ -111,9 +115,19 @@ def get_buffer_low_latency(
+     return _buffer_low_latency
+ 
+ 
++def get_m_indices(
++    num_tokens_per_expert: torch.Tensor,
++) -> torch.Tensor:
++    nonzero_expert_idxs = torch.nonzero(num_tokens_per_expert)
++    nonzero_expert_tokens = num_tokens_per_expert[nonzero_expert_idxs].view(-1)
++    m_indices = torch.repeat_interleave(nonzero_expert_idxs, nonzero_expert_tokens, dim=0).view(-1).to(dtype=torch.int32)
++    return m_indices
++
++
+ def permute(
+     tokens,
+     routing_map,
++    # tokens_per_expert: torch.Tensor = None,
+     num_out_tokens: Optional[int] = None,
+     fused: bool = False,
+     drop_and_pad: bool = False,
+@@ -142,6 +156,14 @@ def permute(
+         )
+         sorted_indices = token_indices.masked_select(routing_map)
+     permuted_input = tokens.index_select(0, sorted_indices)
++    # tokens_per_ex = get_m_indices(tokens_per_expert)
++    # tokens_per_2 = routing_map.sum(dim=1)
++    # print(tokens_per_ex)
++    # print(tokens_per_expert)
++    # print(tokens_per_2)
++    # assert tokens_per_2 == tokens_per_expert
++    # assert sorted_indices < 128, f"permuted_input value {permuted_input=}, {sorted_indices=}"
++    # assert permuted_input.shape[0] == sorted_indices.shape[0], f"hidden status {permuted_input.shape[0]} shape_0{sorted_indices.shape[0]} is not equal to sorted_indices."
+ 
+     return permuted_input, sorted_indices
+ 
+@@ -211,6 +233,7 @@ class DeepEPDispatcher:
+         num_local_experts: int = None,
+         hidden_size: int = None,
+         params_dtype: torch.dtype = None,
++        async_finish: bool = False,
+     ):
+         self.group = group
+         self.router_topk = router_topk
+@@ -226,6 +249,7 @@ class DeepEPDispatcher:
+         self.token_probs = None
+         # Handle used for combine operation
+         self.handle = None
++        self.async_finish = async_finish
+ 
+         # `num_max_dispatch_tokens_per_rank` (the actual batch size in the decoding engine) should be less than 256
+         # https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
+@@ -247,16 +271,13 @@ class DeepEPDispatcher:
+ 
+     def deepep_permute(
+         self,
+-        topk_ids,
+         hidden_states,
+-        num_experts,
+-        top_k,
+-        use_fp8_w8a8,
+-        use_block_quant,
+-        fp8_dtype,
++        fp8_dtype=None,
++        use_fp8_w8a8=False,
++        use_block_quant=False,
+     ):
+         reorder_topk_ids, src2dst, seg_indptr = deepep_run_moe_deep_preprocess(
+-            topk_ids, num_experts
++            self.topk_idx, self.num_experts
+         )
+         num_total_tokens = reorder_topk_ids.numel()
+         gateup_input = torch.empty(
+@@ -273,15 +294,73 @@ class DeepEPDispatcher:
+             hidden_states,
+             gateup_input,
+             src2dst,
+-            topk_ids,
++            self.topk_idx,
+             None,
+-            top_k,
++            self.router_topk,
+             hidden_states.shape[1],
+             BLOCK_SIZE=512,
+         )
+         self.src2dst = src2dst
+         return reorder_topk_ids, seg_indptr, gateup_input
+ 
++    def dispatch_2(
++        self,
++        hidden_states: torch.Tensor,
++        topk_idx: torch.Tensor,
++        topk_weights: torch.Tensor,
++        num_experts: int,
++        previous_event=None,
++        num_max_dispatch_tokens_per_rank: int = 128,
++        is_prefill: bool = True,
++    ) -> Tuple[torch.Tensor, torch.Tensor]:
++        self.hidden_shape = hidden_states.shape
++        topk_idx = topk_idx.to(torch.int64)
++        
++        # print(f"before dispatch: {hidden_states.shape=}, {topk_idx.shape=}, {topk_weights.shape=}")
++        if is_prefill:
++            (
++                hidden_states,
++                topk_idx,
++                topk_weights,
++                num_recv_tokens_per_expert_list,
++                handle,
++                event,
++            ) = self.dispatch_normal(hidden_states, topk_idx, topk_weights, num_experts)
++            self.tokens_per_expert = torch.tensor(
++                num_recv_tokens_per_expert_list,
++                device=hidden_states.device,
++                dtype=torch.int64,
++            )
++        else:
++            hidden_states, recv_expert_count, handle, event, hook = (
++                self.dispatch_low_latency(
++                    hidden_states,
++                    topk_idx,
++                    num_max_dispatch_tokens_per_rank,
++                    num_experts,
++                )
++            )
++            self.tokens_per_expert = recv_expert_count
++
++        if self.async_finish:
++            event.current_stream_wait()
++
++        self.handle = handle
++        self.topk_idx = topk_idx
++        self.topk_weights = topk_weights
++        if hidden_states.shape[0] > 0:
++            reorder_topk_ids, seg_indptr, hidden_states = self.deepep_permute(
++                hidden_states, fp8_dtype=hidden_states.dtype
++            )
++        else:
++            reorder_topk_ids = torch.empty(
++                (0,), device=hidden_states.device, dtype=torch.int64
++            )
++            seg_indptr = torch.zeros(
++                (num_experts + 1,), device=hidden_states.device, dtype=torch.int64
++            )
++        return hidden_states, reorder_topk_ids, seg_indptr, self.tokens_per_expert
++
+     def dispatch(
+         self,
+         hidden_states: torch.Tensor,
+@@ -294,6 +373,8 @@ class DeepEPDispatcher:
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
+         self.hidden_shape = hidden_states.shape
+         topk_idx = topk_idx.to(torch.int64)
++        
++        # print(f"before dispatch: {hidden_states.shape=}, {topk_idx.shape=}, {topk_weights.shape=}")
+         if is_prefill:
+             (
+                 hidden_states,
+@@ -305,6 +386,8 @@ class DeepEPDispatcher:
+             ) = self.dispatch_normal(
+                 hidden_states, topk_idx, topk_weights, num_experts, previous_event
+             )
++            
++            # print(f"after dispatch: {hidden_states.shape=}, {topk_idx.shape=}, {topk_weights.shape=}, {num_recv_tokens_per_expert_list=}")
+             self.tokens_per_expert = torch.tensor(
+                 num_recv_tokens_per_expert_list,
+                 device=hidden_states.device,
+@@ -329,7 +412,7 @@ class DeepEPDispatcher:
+             if hidden_states.shape[0] > 0:
+                 hidden_states = self.get_permuted_hidden_states_by_experts(hidden_states)
+ 
+-        return hidden_states, topk_idx, topk_weights, tokens_per_expert
++        return hidden_states, topk_idx, topk_weights, tokens_per_expert, self.valid_indices
+ 
+     def dispatch_normal(
+         self,
+@@ -443,6 +526,47 @@ class DeepEPDispatcher:
+         # hook()
+         return recv_hidden_states, recv_expert_count, handle, event, hook
+ 
++    def combine_2(
++        self, hidden_states: torch.Tensor, 
++        is_prefill: bool = True,
++    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
++        # Todo: enable low latency combine
++        if is_prefill:  # not forward_mode.is_decode():
++            if hidden_states.shape[0] > 0:
++                num_tokens = self.src2dst.shape[0] // self.router_topk
++                output = torch.empty(
++                    (num_tokens, hidden_states.shape[1]),
++                    device=hidden_states.device,
++                    dtype=hidden_states.dtype,
++                )
++                deepep_post_reorder_triton_kernel[(num_tokens,)](
++                    hidden_states,
++                    output,
++                    self.src2dst,
++                    self.topk_idx,
++                    self.topk_weights,
++                    self.router_topk,
++                    hidden_states.shape[1],
++                    BLOCK_SIZE=512,
++                )
++            else:
++                output = torch.zeros(
++                    (0, hidden_states.shape[1]),
++                    device=hidden_states.device,
++                    dtype=hidden_states.dtype,
++                )
++            hidden_states, event = self.combine_normal(output, self.handle)
++        else:
++            hidden_states, event, hook = self.combine_low_latency(
++                hidden_states, self.topk_idx, self.topk_weights, self.handle
++            )
++
++        if self.async_finish:
++            event.current_stream_wait()
++
++        self.handle = None
++        return hidden_states
++
+     def combine(
+         self, hidden_states: torch.Tensor, 
+         is_prefill: bool = True,
+@@ -464,6 +588,7 @@ class DeepEPDispatcher:
+         combined_x, _, event = self.buffer_normal.combine(
+             x,
+             handle,
++            # self.topk_weights,#topk
+             async_finish=False,
+             previous_event=previous_event,
+             allocate_on_comm_stream=False,
+@@ -511,7 +636,7 @@ class DeepEPDispatcher:
+         )
+         multihot_routing_map[row_indices, valid_indices] = 1
+         multihot_probs[row_indices, valid_indices] = probs[mask]
+-        return multihot_routing_map.bool(), multihot_probs
++        return multihot_routing_map.bool(), multihot_probs, valid_indices
+ 
+     def get_dispached_metadata(self) -> torch.Tensor:
+         return self.topk_idx, self.topk_weights
+@@ -525,16 +650,19 @@ class DeepEPDispatcher:
+     def get_permuted_hidden_states_by_experts(
+         self, hidden_states: torch.Tensor
+     ) -> torch.Tensor:
+-        self.dispatched_routing_map, self.topk_weights = self._indices_to_multihot(
++        self.dispatched_routing_map, self.topk_weights, self.valid_indices = self._indices_to_multihot(
+             self.topk_idx, self.topk_weights
+         )
++        # print(f"after: _indices_to_multihot: {hidden_states.shape=}, {self.topk_weights=}, {self.dispatched_routing_map=}")
+         self.hidden_shape_before_permute = hidden_states.shape
+         hidden_states, self.reversed_mapping_for_combine = permute(
+             hidden_states,
+             self.dispatched_routing_map,
+             num_out_tokens=self.tokens_per_expert.sum(),
+             fused=self.permute_fusion,
++            # tokens_per_expert=self.tokens_per_expert,
+         )
++        # print(f"after: permute: {hidden_states.shape=}, {self.reversed_mapping_for_combine=}")
+         return hidden_states
+ 
+     def get_restored_hidden_states_by_experts(
+diff --git a/vllm/model_executor/models/deepseek_v2.py b/vllm/model_executor/models/deepseek_v2.py
+index 5d9ebaf80..582b2314e 100644
+--- a/vllm/model_executor/models/deepseek_v2.py
++++ b/vllm/model_executor/models/deepseek_v2.py
+@@ -63,7 +63,17 @@ from .interfaces import SupportsPP
+ from .utils import (PPMissingLayer, is_pp_missing_parameter,
+                     make_empty_intermediate_tensors_factory, make_layers,
+                     maybe_prefix)
++import json, os
+ 
++class CustomData:
++    def __init__(self, tensor):
++        self.tensor = tensor
++
++def custom_serializer(obj):
++    if isinstance(obj, CustomData):
++        return {"tensor": obj.tensor.tolist()}
++    raise TypeError("Unsupported type")
++    
+ 
+ class DeepseekV2MLP(nn.Module):
+ 
+@@ -115,7 +125,8 @@ class DeepseekV2MoE(nn.Module):
+         self.routed_scaling_factor = config.routed_scaling_factor
+         self.n_shared_experts = config.n_shared_experts
+         self.parallel_config = parallel_config
+-        self.enable_deepep_moe = self.parallel_config.enable_deepep_moe 
++        self.enable_deepep_moe = self.parallel_config.enable_deepep_moe
++        self.counter = 0
+ 
+         if config.hidden_act != "silu":
+             raise ValueError(f"Unsupported activation: {config.hidden_act}. "
+@@ -226,10 +237,18 @@ class DeepseekV2MoE(nn.Module):
+             final_hidden_states = tensor_model_parallel_all_reduce(
+                 final_hidden_states)
+ 
++        # print(f"{final_hidden_states.shape=}: final_hidden_states: {final_hidden_states}")
+         return final_hidden_states.view(num_tokens, hidden_dim)
+ 
+     def forward_deepep(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         num_tokens, hidden_dim = hidden_states.shape
++        
++        debug = False
++        local_rank = torch.distributed.get_rank()
++
++        if debug:
++            print(f"{local_rank=}: {num_tokens=}, {hidden_dim=}, {self.top_k=}, {self.renormalize=}, {self.topk_group=}, {self.num_expert_group=}, {self.scoring_func=},")
++
+         hidden_states = hidden_states.view(-1, hidden_dim)
+         shared_output = None
+         topk_idx = torch.full(
+@@ -241,9 +260,14 @@ class DeepseekV2MoE(nn.Module):
+ 
+         # router_logits: (num_tokens, n_experts)
+         router_logits, _ = self.gate(hidden_states)
++
++        if debug:
++            print(f"{local_rank=}: {router_logits.shape=}")
++        
+         # random router in dummy run to work around dispatch unbalanced
+         if is_dummy_running():
+             router_logits = torch.randn_like(router_logits)
++            # print(f"{local_rank=}: dummy_run")
+         if self.n_shared_experts is not None:
+             shared_output = self.shared_experts(hidden_states)
+ 
+@@ -259,6 +283,9 @@ class DeepseekV2MoE(nn.Module):
+             e_score_correction_bias=self.gate.e_score_correction_bias,
+         )
+ 
++        if debug:
++            print(f"{local_rank=}: {topk_weights.shape=}, {topk_idx.shape=}")
++
+         # TODO modify by pd disaggregate, always run prefill mode now.
+         is_prefill = True
+ 
+@@ -275,35 +302,91 @@ class DeepseekV2MoE(nn.Module):
+             # dispatch topk
+             # space without redundant experts -> space with redundant experts
+             topk_idx = self.expert_weights_per_layer.dispatch_experts(topk_idx)
++        
++        triton = True
++        if triton:
++            if self.dp_size > 1:
++                recv_hidden_states, reorder_topk_ids, seg_indptr, tokens_per_expert = (
++                    self.deepep_dispatcher.dispatch_2(
++                        hidden_states,
++                        topk_idx,
++                        topk_weights,
++                        self.num_experts,
++                        is_prefill=is_prefill,
++                    )
++                )
++
++            if debug:
++                print(f"{local_rank=}: {recv_hidden_states.shape=}, {topk_idx.shape=}, {topk_weights.shape=}, {reorder_topk_ids.shape=}, {seg_indptr.shape=},")
+ 
+-        if self.dp_size > 1:
+-            recv_hidden_states, topk_idx, topk_weights, tokens_per_expert = (
+-                self.deepep_dispatcher.dispatch(
+-                    hidden_states,
+-                    topk_idx,
+-                    topk_weights,
+-                    self.num_experts,
++            # final_hidden_states = recv_hidden_states
++            final_hidden_states = (
++                self.experts(
++                    hidden_states=recv_hidden_states,
++                    reorder_topk_ids=reorder_topk_ids,
++                    seg_indptr=seg_indptr,
+                     is_prefill=is_prefill,
++                    tokens_per_expert=tokens_per_expert,
+                 )
++                * self.routed_scaling_factor
+             )
+ 
+-        final_hidden_states = (
+-            self.experts(
+-                hidden_states=recv_hidden_states,
+-                tokens_per_expert=tokens_per_expert,
+-                is_prefill=is_prefill,
+-            )
+-            * self.routed_scaling_factor
+-        )
+-        if self.dp_size > 1:
+-            final_hidden_states = self.deepep_dispatcher.combine(
+-                final_hidden_states,
+-                is_prefill=is_prefill,
++            if debug:
++                print(f"{local_rank=}: {final_hidden_states.shape=}")
++
++            if self.dp_size > 1:
++                final_hidden_states = self.deepep_dispatcher.combine_2(
++                    final_hidden_states,
++                    is_prefill=is_prefill,
++                )
++
++                if debug:
++                    print(f"{local_rank=}: after combine: {final_hidden_states.shape=}")
++        else:
++            if self.dp_size > 1:
++                recv_hidden_states, topk_idx, topk_weights, tokens_per_expert, valid_indices = (
++                    self.deepep_dispatcher.dispatch(
++                        hidden_states,
++                        topk_idx,
++                        topk_weights,
++                        self.num_experts,
++                        is_prefill=is_prefill,
++                    )
++                )
++
++                if debug:
++                    print(f"{local_rank=}: {recv_hidden_states.shape=}, {topk_idx.shape=}, {topk_weights.shape=}, {tokens_per_expert.shape=}, {valid_indices.shape=},")
++
++            # final_hidden_states = recv_hidden_states
++            final_hidden_states = (
++                self.experts(
++                    hidden_states=recv_hidden_states,
++                    tokens_per_expert=tokens_per_expert,
++                    valid_indices=valid_indices,
++                    is_prefill=is_prefill,
++                )
++                * self.routed_scaling_factor
+             )
+ 
++            if debug:
++                print(f"{local_rank=}: {final_hidden_states.shape=}")
++
++            if self.dp_size > 1:
++                final_hidden_states = self.deepep_dispatcher.combine(
++                    final_hidden_states,
++                    is_prefill=is_prefill,
++                )
++
++                if debug:
++                    print(f"{local_rank=}: after combine: {final_hidden_states.shape=}")
++
+         if shared_output is not None:
+             final_hidden_states = final_hidden_states + shared_output
+ 
++            if debug:
++                print(f"{local_rank=}: add share expert: {final_hidden_states.shape=}")
++
++        # print(f"{final_hidden_states.shape=}: final_hidden_states: {final_hidden_states}")
+         return final_hidden_states.view(num_tokens, hidden_dim)
+ 
+ 
+@@ -674,6 +757,7 @@ class DeepseekV2DecoderLayer(nn.Module):
+         self.post_attention_layernorm = RMSNorm(config.hidden_size,
+                                                 eps=config.rms_norm_eps)
+         self.routed_scaling_factor = config.routed_scaling_factor
++        self.layer_idx = layer_idx
+ 
+     def forward(
+         self,
+@@ -817,11 +901,12 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
+ 
+         from vllm.config import get_current_vllm_config
+         redundant_num_experts = get_current_vllm_config().parallel_config.redundant_num_experts
+-        self._initialize_expert_weight(
+-            self.config.num_hidden_layers, 
+-            self.config.n_routed_experts,
+-            redundant_num_experts
+-        )
++        if redundant_num_experts > 0:
++            self._initialize_expert_weight(
++                self.config.num_hidden_layers, 
++                self.config.n_routed_experts,
++                redundant_num_experts
++            )
+         
+ 
+     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+@@ -972,7 +1057,7 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
+                     # except:
+                     #     pass
+             loaded_params.add(name)
+-        self._reload_experts()
++        # self._reload_experts()
+ 
+         return loaded_params
+ 
+@@ -991,10 +1076,11 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
+                         layer.mlp.experts.expert_weights_per_layer = ExpertWeightsPerLayer(i, self.expert_weight)
+ 
+     def rebalance_experts(self):
+-        # get new expert ids stored on each GPU
+-        self.expert_weight.rebalance()
+-        # reload follow self.expert_weight.expert_ids
+-        self._reload_experts()
++        pass
++        # # get new expert ids stored on each GPU
++        # self.expert_weight.rebalance()
++        # # reload follow self.expert_weight.expert_ids
++        # self._reload_experts()
+ 
+     def _reload_experts(self):
+         min_index = get_dp_group().rank * self.expert_weight.num_experts_local
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 69936c1cb..eb330d147 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -1056,7 +1056,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # this may be error . 
+         
+         if bypass_model_exec is False:
+-            logger.info("set_forward_context , bypass_model_exec : {}".format(bypass_model_exec))
++            # logger.info("set_forward_context , bypass_model_exec : {}".format(bypass_model_exec))
+         
+             with set_forward_context(attn_metadata, self.vllm_config):
+                 hidden_states = self.model(

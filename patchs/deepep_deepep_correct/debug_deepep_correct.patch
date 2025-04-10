@@ -1,0 +1,503 @@
+diff --git a/vllm/model_executor/layers/fused_moe/deep_gemm_moe.py b/vllm/model_executor/layers/fused_moe/deep_gemm_moe.py
+index be770d88c..b80b903e2 100644
+--- a/vllm/model_executor/layers/fused_moe/deep_gemm_moe.py
++++ b/vllm/model_executor/layers/fused_moe/deep_gemm_moe.py
+@@ -3,6 +3,17 @@ import torch
+ import deep_gemm as dg
+ import vllm.envs as envs
+ from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8
++import json, os
++
++
++class CustomData:
++    def __init__(self, tensor):
++        self.tensor = tensor
++
++def custom_serializer(obj):
++    if isinstance(obj, CustomData):
++        return {"tensor": obj.tensor.tolist()}
++    raise TypeError("Unsupported type")
+ 
+ 
+ def get_m_indices(
+@@ -108,6 +119,7 @@ def deep_gemm_grouped_gemm_masked(
+ def deep_gemm_prefill_moe(
+     hidden_states: torch.Tensor,
+     num_tokens_per_expert: torch.Tensor,
++    valid_indices: torch.Tensor,
+     w1: torch.Tensor,
+     w1_s: torch.Tensor,
+     w2: torch.Tensor,
+@@ -127,16 +139,60 @@ def deep_gemm_prefill_moe(
+                           device=hidden_states.device,
+                           dtype=hidden_states.dtype)
+ 
++    debug = False
++    local_rank = torch.distributed.get_rank()
++    if not hasattr(deep_gemm_prefill_moe, 'counter'):  # 首次调用时初始化
++        deep_gemm_prefill_moe.counter = 0
++    deep_gemm_prefill_moe.counter += 1
++    folder_1 = "seqs3"
++    folder_2 = f"{deep_gemm_prefill_moe.counter:03d}"
++    folder_name = [folder_1, folder_2]
++    
++    full_path = os.path.join(os.getcwd(), *folder_name)
++    os.makedirs(full_path, exist_ok=True)
++        
++    if debug:
++        print(f"{local_rank=}: {hidden_states.shape[0]=}: ")
++        data = CustomData(hidden_states.cpu())
++        file_name = "hidden_states_" + str(local_rank) + ".json"
++        file_path = os.path.join(full_path, file_name)
++        with open(file_path, "w") as f:
++            json.dump(data, f, default=custom_serializer)
++
+     m_indices = get_m_indices(num_tokens_per_expert)
++    valid_indices = valid_indices.to(dtype=torch.int32)
+ 
+     deep_gemm_grouped_gemm_contiguous(
+         hidden_states,
+         w1,
+         w1_s,
+         intermediate_cache1,
+-        m_indices,
++        valid_indices,
+         block_k=block_k,
+     )
++        
++    if debug:
++        print(f"{local_rank=}: {hidden_states.shape[0]=}: {intermediate_cache1.shape=}, {m_indices.shape=}, {w1.shape=}, {w1_s.shape=}")
++        data = CustomData(intermediate_cache1.cpu())
++        file_name = "intermediate_cache1_" + str(local_rank) + ".json"
++        file_path = os.path.join(full_path, file_name)
++        with open(file_path, "w") as f:
++            json.dump(data, f, default=custom_serializer)
++        data = CustomData(m_indices.cpu())
++        file_name = "m_indices_" + str(local_rank) + ".json"
++        file_path = os.path.join(full_path, file_name)
++        with open(file_path, "w") as f:
++            json.dump(data, f, default=custom_serializer)
++        data = CustomData(w1[0, 0, :].cpu())
++        file_name = "w1_" + str(local_rank) + ".json"
++        file_path = os.path.join(full_path, file_name)
++        with open(file_path, "w") as f:
++            json.dump(data, f, default=custom_serializer)
++        data = CustomData(w1_s[0, 0, :].cpu())
++        file_name = "w1_s_" + str(local_rank) + ".json"
++        file_path = os.path.join(full_path, file_name)
++        with open(file_path, "w") as f:
++            json.dump(data, f, default=custom_serializer)
+ 
+     if activation == "silu":
+         torch.ops._C.silu_and_mul(intermediate_cache2,
+@@ -144,15 +200,41 @@ def deep_gemm_prefill_moe(
+     elif activation == "gelu":
+         torch.ops._C.gelu_and_mul(intermediate_cache2,
+                                   intermediate_cache1.view(EM, N))
++        
++    if debug:
++        print(f"{local_rank=}: {hidden_states.shape[0]=}: {intermediate_cache2.shape=}, {N=}")
++        data = CustomData(intermediate_cache2.cpu())
++        file_name = "intermediate_cache2_" + str(local_rank) + ".json"
++        file_path = os.path.join(full_path, file_name)
++        with open(file_path, "w") as f:
++            json.dump(data, f, default=custom_serializer)
+ 
+     deep_gemm_grouped_gemm_contiguous(
+         intermediate_cache2,
+         w2,
+         w2_s,
+         output,
+-        m_indices,
++        valid_indices,
+         block_k=block_k,
+     )
++        
++    if debug:
++        print(f"{local_rank=}: {hidden_states.shape[0]=}: {output.shape=}, {w2.shape=}, {w2_s.shape=}")
++        data = CustomData(output.cpu())
++        file_name = "output_" + str(local_rank) + ".json"
++        file_path = os.path.join(full_path, file_name)
++        with open(file_path, "w") as f:
++            json.dump(data, f, default=custom_serializer)
++        data = CustomData(w2[0, 0, :].cpu())
++        file_name = "w2_" + str(local_rank) + ".json"
++        file_path = os.path.join(full_path, file_name)
++        with open(file_path, "w") as f:
++            json.dump(data, f, default=custom_serializer)
++        data = CustomData(w2_s[0, 0, :].cpu())
++        file_name = "w2_s_" + str(local_rank) + ".json"
++        file_path = os.path.join(full_path, file_name)
++        with open(file_path, "w") as f:
++            json.dump(data, f, default=custom_serializer)
+ 
+     return output
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/layer.py b/vllm/model_executor/layers/fused_moe/layer.py
+index 9aea9a6f4..c99b4da68 100644
+--- a/vllm/model_executor/layers/fused_moe/layer.py
++++ b/vllm/model_executor/layers/fused_moe/layer.py
+@@ -980,10 +980,11 @@ class DeepEPMoE(FusedMoE):
+         self,
+         hidden_states: torch.Tensor,
+         tokens_per_expert: torch.Tensor,
++        valid_indices: Optional[torch.Tensor],
+         is_prefill: bool,
+     ):
+         if is_prefill:
+-            return self.forward_prefill(hidden_states, tokens_per_expert)
++            return self.forward_prefill(hidden_states, tokens_per_expert, valid_indices)
+         else:
+             return self.forward_decode(hidden_states, tokens_per_expert)
+ 
+@@ -991,11 +992,11 @@ class DeepEPMoE(FusedMoE):
+         self,
+         hidden_states: torch.Tensor,
+         tokens_per_expert: torch.Tensor,
++        valid_indices: Optional[torch.Tensor],
+     ):
+         from vllm.model_executor.layers.fused_moe.deep_gemm_moe import deep_gemm_prefill_moe
+ 
+         assert self.quant_method is not None and self.quant_method.block_quant, "DeepGEMM only support block quant."
+-
+         output = torch.empty(
+             hidden_states.shape[0],
+             self.w2_weight.shape[1],
+@@ -1007,13 +1008,14 @@ class DeepEPMoE(FusedMoE):
+             output = deep_gemm_prefill_moe(
+                 hidden_states,
+                 tokens_per_expert,
++                valid_indices,
+                 self.w13_weight,
+                 self.w13_weight_scale_inv,
+                 self.w2_weight,
+                 self.w2_weight_scale_inv,
+                 output,
+                 block_k=128,
+-                activation=self.activation,
++                activation=self.activation, 
+             )
+ 
+         return output
+diff --git a/vllm/model_executor/layers/fused_moe/token_dispatcher.py b/vllm/model_executor/layers/fused_moe/token_dispatcher.py
+index 189aba692..05f58f1be 100644
+--- a/vllm/model_executor/layers/fused_moe/token_dispatcher.py
++++ b/vllm/model_executor/layers/fused_moe/token_dispatcher.py
+@@ -294,6 +294,8 @@ class DeepEPDispatcher:
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
+         self.hidden_shape = hidden_states.shape
+         topk_idx = topk_idx.to(torch.int64)
++        
++        # print(f"before dispatch: {hidden_states.shape=}, {topk_idx.shape=}, {topk_weights.shape=}")
+         if is_prefill:
+             (
+                 hidden_states,
+@@ -305,6 +307,8 @@ class DeepEPDispatcher:
+             ) = self.dispatch_normal(
+                 hidden_states, topk_idx, topk_weights, num_experts, previous_event
+             )
++            
++            # print(f"after dispatch: {hidden_states.shape=}, {topk_idx.shape=}, {topk_weights.shape=}, {num_recv_tokens_per_expert_list=}")
+             self.tokens_per_expert = torch.tensor(
+                 num_recv_tokens_per_expert_list,
+                 device=hidden_states.device,
+@@ -329,7 +333,7 @@ class DeepEPDispatcher:
+             if hidden_states.shape[0] > 0:
+                 hidden_states = self.get_permuted_hidden_states_by_experts(hidden_states)
+ 
+-        return hidden_states, topk_idx, topk_weights, tokens_per_expert
++        return hidden_states, topk_idx, topk_weights, tokens_per_expert, self.reversed_mapping_for_combine
+ 
+     def dispatch_normal(
+         self,
+@@ -464,6 +468,7 @@ class DeepEPDispatcher:
+         combined_x, _, event = self.buffer_normal.combine(
+             x,
+             handle,
++            # self.topk_weights,#topk
+             async_finish=False,
+             previous_event=previous_event,
+             allocate_on_comm_stream=False,
+@@ -511,7 +516,7 @@ class DeepEPDispatcher:
+         )
+         multihot_routing_map[row_indices, valid_indices] = 1
+         multihot_probs[row_indices, valid_indices] = probs[mask]
+-        return multihot_routing_map.bool(), multihot_probs
++        return multihot_routing_map.bool(), multihot_probs, valid_indices
+ 
+     def get_dispached_metadata(self) -> torch.Tensor:
+         return self.topk_idx, self.topk_weights
+@@ -525,9 +530,10 @@ class DeepEPDispatcher:
+     def get_permuted_hidden_states_by_experts(
+         self, hidden_states: torch.Tensor
+     ) -> torch.Tensor:
+-        self.dispatched_routing_map, self.topk_weights = self._indices_to_multihot(
++        self.dispatched_routing_map, self.topk_weights, self.valid_indices = self._indices_to_multihot(
+             self.topk_idx, self.topk_weights
+         )
++        # print(f"after: _indices_to_multihot: {hidden_states.shape=}, {self.topk_weights=}, {self.dispatched_routing_map=}")
+         self.hidden_shape_before_permute = hidden_states.shape
+         hidden_states, self.reversed_mapping_for_combine = permute(
+             hidden_states,
+@@ -535,6 +541,7 @@ class DeepEPDispatcher:
+             num_out_tokens=self.tokens_per_expert.sum(),
+             fused=self.permute_fusion,
+         )
++        # print(f"after: permute: {hidden_states.shape=}, {self.reversed_mapping_for_combine=}")
+         return hidden_states
+ 
+     def get_restored_hidden_states_by_experts(
+diff --git a/vllm/model_executor/models/deepseek_v2.py b/vllm/model_executor/models/deepseek_v2.py
+index 5d9ebaf80..85a0544ec 100644
+--- a/vllm/model_executor/models/deepseek_v2.py
++++ b/vllm/model_executor/models/deepseek_v2.py
+@@ -63,7 +63,17 @@ from .interfaces import SupportsPP
+ from .utils import (PPMissingLayer, is_pp_missing_parameter,
+                     make_empty_intermediate_tensors_factory, make_layers,
+                     maybe_prefix)
++import json, os
+ 
++class CustomData:
++    def __init__(self, tensor):
++        self.tensor = tensor
++
++def custom_serializer(obj):
++    if isinstance(obj, CustomData):
++        return {"tensor": obj.tensor.tolist()}
++    raise TypeError("Unsupported type")
++    
+ 
+ class DeepseekV2MLP(nn.Module):
+ 
+@@ -115,7 +125,8 @@ class DeepseekV2MoE(nn.Module):
+         self.routed_scaling_factor = config.routed_scaling_factor
+         self.n_shared_experts = config.n_shared_experts
+         self.parallel_config = parallel_config
+-        self.enable_deepep_moe = self.parallel_config.enable_deepep_moe 
++        self.enable_deepep_moe = self.parallel_config.enable_deepep_moe
++        self.counter = 0
+ 
+         if config.hidden_act != "silu":
+             raise ValueError(f"Unsupported activation: {config.hidden_act}. "
+@@ -226,10 +237,30 @@ class DeepseekV2MoE(nn.Module):
+             final_hidden_states = tensor_model_parallel_all_reduce(
+                 final_hidden_states)
+ 
++        # print(f"{final_hidden_states.shape=}: final_hidden_states: {final_hidden_states}")
+         return final_hidden_states.view(num_tokens, hidden_dim)
+ 
+     def forward_deepep(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         num_tokens, hidden_dim = hidden_states.shape
++        
++        debug = False
++        local_rank = torch.distributed.get_rank()
++        self.counter += 1
++        folder_1 = "seqs3"
++        folder_2 = f"{self.counter:03d}"
++        folder_name = [folder_1, folder_2]
++        
++        full_path = os.path.join(os.getcwd(), *folder_name)
++        os.makedirs(full_path, exist_ok=True)
++
++        if debug:
++            print(f"{local_rank=}: {num_tokens=}, {hidden_dim=}, {self.top_k=}, {self.renormalize=}, {self.topk_group=}, {self.num_expert_group=}, {self.scoring_func=},")
++            data = CustomData(hidden_states.cpu())
++            file_name = "input_hiddensize_" + str(local_rank) + ".json"
++            file_path = os.path.join(full_path, file_name)
++            with open(file_path, "w") as f:
++                json.dump(data, f, default=custom_serializer)
++
+         hidden_states = hidden_states.view(-1, hidden_dim)
+         shared_output = None
+         topk_idx = torch.full(
+@@ -241,12 +272,31 @@ class DeepseekV2MoE(nn.Module):
+ 
+         # router_logits: (num_tokens, n_experts)
+         router_logits, _ = self.gate(hidden_states)
++
++        if debug:
++            print(f"{local_rank=}: {router_logits.shape=}")
++            data = CustomData(router_logits.cpu())
++            file_name = "router_logits_" + str(local_rank) + ".json"
++            file_path = os.path.join(full_path, file_name)
++            with open(file_path, "w") as f:
++                json.dump(data, f, default=custom_serializer)
++
++        
+         # random router in dummy run to work around dispatch unbalanced
+         if is_dummy_running():
+             router_logits = torch.randn_like(router_logits)
++            # print(f"{local_rank=}: dummy_run")
+         if self.n_shared_experts is not None:
+             shared_output = self.shared_experts(hidden_states)
+ 
++            if debug:
++                print(f"{local_rank=}: {router_logits.shape=}")
++                data = CustomData(shared_output.cpu())
++                file_name = "shared_output_" + str(local_rank) + ".json"
++                file_path = os.path.join(full_path, file_name)
++                with open(file_path, "w") as f:
++                    json.dump(data, f, default=custom_serializer)
++
+         topk_weights, topk_idx = FusedMoE.select_experts(
+             hidden_states=hidden_states,
+             router_logits=router_logits,
+@@ -259,6 +309,19 @@ class DeepseekV2MoE(nn.Module):
+             e_score_correction_bias=self.gate.e_score_correction_bias,
+         )
+ 
++        if debug:
++            print(f"{local_rank=}: {topk_weights.shape=}, {topk_idx.shape=}")
++            data = CustomData(topk_weights.cpu())
++            file_name = "topk_weights_" + str(local_rank) + ".json"
++            file_path = os.path.join(full_path, file_name)
++            with open(file_path, "w") as f:
++                json.dump(data, f, default=custom_serializer)
++            data = CustomData(topk_idx.cpu())
++            file_name = "topk_idx_" + str(local_rank) + ".json"
++            file_path = os.path.join(full_path, file_name)
++            with open(file_path, "w") as f:
++                json.dump(data, f, default=custom_serializer)
++
+         # TODO modify by pd disaggregate, always run prefill mode now.
+         is_prefill = True
+ 
+@@ -277,7 +340,7 @@ class DeepseekV2MoE(nn.Module):
+             topk_idx = self.expert_weights_per_layer.dispatch_experts(topk_idx)
+ 
+         if self.dp_size > 1:
+-            recv_hidden_states, topk_idx, topk_weights, tokens_per_expert = (
++            recv_hidden_states, topk_idx, topk_weights, tokens_per_expert, valid_indices = (
+                 self.deepep_dispatcher.dispatch(
+                     hidden_states,
+                     topk_idx,
+@@ -287,23 +350,73 @@ class DeepseekV2MoE(nn.Module):
+                 )
+             )
+ 
++            if debug:
++                print(f"{local_rank=}: {recv_hidden_states.shape=}, {topk_idx.shape=}, {topk_weights.shape=}, {tokens_per_expert.shape=}")
++                data = CustomData(recv_hidden_states.cpu())
++                file_name = "recv_hidden_states_" + str(local_rank) + ".json"
++                file_path = os.path.join(full_path, file_name)
++                with open(file_path, "w") as f:
++                    json.dump(data, f, default=custom_serializer)
++                data = CustomData(topk_idx.cpu())
++                file_name = "topk_idx_after_dispatch_" + str(local_rank) + ".json"
++                file_path = os.path.join(full_path, file_name)
++                with open(file_path, "w") as f:
++                    json.dump(data, f, default=custom_serializer)
++                data = CustomData(topk_weights.cpu())
++                file_name = "topk_weights_after_dispatch_" + str(local_rank) + ".json"
++                file_path = os.path.join(full_path, file_name)
++                with open(file_path, "w") as f:
++                    json.dump(data, f, default=custom_serializer)
++                data = CustomData(tokens_per_expert.cpu())
++                file_name = "tokens_per_expert_after_dispatch_" + str(local_rank) + ".json"
++                file_path = os.path.join(full_path, file_name)
++                with open(file_path, "w") as f:
++                    json.dump(data, f, default=custom_serializer)
++
+         final_hidden_states = (
+             self.experts(
+                 hidden_states=recv_hidden_states,
+                 tokens_per_expert=tokens_per_expert,
++                valid_indices=valid_indices,
+                 is_prefill=is_prefill,
+             )
+             * self.routed_scaling_factor
+         )
++
++        if debug:
++            print(f"{local_rank=}: {final_hidden_states.shape=}")
++            data = CustomData(final_hidden_states.cpu())
++            file_name = "final_hidden_states_" + str(local_rank) + ".json"
++            file_path = os.path.join(full_path, file_name)
++            with open(file_path, "w") as f:
++                json.dump(data, f, default=custom_serializer)
++
+         if self.dp_size > 1:
+             final_hidden_states = self.deepep_dispatcher.combine(
+                 final_hidden_states,
+                 is_prefill=is_prefill,
+             )
+ 
++            if debug:
++                print(f"{local_rank=}: after combine: {final_hidden_states.shape=}")
++                data = CustomData(final_hidden_states.cpu())
++                file_name = "final_hidden_states_after_combine_" + str(local_rank) + ".json"
++                file_path = os.path.join(full_path, file_name)
++                with open(file_path, "w") as f:
++                    json.dump(data, f, default=custom_serializer)
++
+         if shared_output is not None:
+             final_hidden_states = final_hidden_states + shared_output
+ 
++            if debug:
++                print(f"{local_rank=}: add share expert: {final_hidden_states.shape=}")
++                data = CustomData(final_hidden_states.cpu())
++                file_name = "final_hidden_states_after_share_" + str(local_rank) + ".json"
++                file_path = os.path.join(full_path, file_name)
++                with open(file_path, "w") as f:
++                    json.dump(data, f, default=custom_serializer)
++
++        # print(f"{final_hidden_states.shape=}: final_hidden_states: {final_hidden_states}")
+         return final_hidden_states.view(num_tokens, hidden_dim)
+ 
+ 
+@@ -817,11 +930,12 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
+ 
+         from vllm.config import get_current_vllm_config
+         redundant_num_experts = get_current_vllm_config().parallel_config.redundant_num_experts
+-        self._initialize_expert_weight(
+-            self.config.num_hidden_layers, 
+-            self.config.n_routed_experts,
+-            redundant_num_experts
+-        )
++        if redundant_num_experts > 0:
++            self._initialize_expert_weight(
++                self.config.num_hidden_layers, 
++                self.config.n_routed_experts,
++                redundant_num_experts
++            )
+         
+ 
+     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+@@ -972,7 +1086,7 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
+                     # except:
+                     #     pass
+             loaded_params.add(name)
+-        self._reload_experts()
++        # self._reload_experts()
+ 
+         return loaded_params
+ 
+@@ -991,10 +1105,11 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
+                         layer.mlp.experts.expert_weights_per_layer = ExpertWeightsPerLayer(i, self.expert_weight)
+ 
+     def rebalance_experts(self):
+-        # get new expert ids stored on each GPU
+-        self.expert_weight.rebalance()
+-        # reload follow self.expert_weight.expert_ids
+-        self._reload_experts()
++        pass
++        # # get new expert ids stored on each GPU
++        # self.expert_weight.rebalance()
++        # # reload follow self.expert_weight.expert_ids
++        # self._reload_experts()
+ 
+     def _reload_experts(self):
+         min_index = get_dp_group().rank * self.expert_weight.num_experts_local
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 69936c1cb..eb330d147 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -1056,7 +1056,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # this may be error . 
+         
+         if bypass_model_exec is False:
+-            logger.info("set_forward_context , bypass_model_exec : {}".format(bypass_model_exec))
++            # logger.info("set_forward_context , bypass_model_exec : {}".format(bypass_model_exec))
+         
+             with set_forward_context(attn_metadata, self.vllm_config):
+                 hidden_states = self.model(

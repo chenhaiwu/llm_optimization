@@ -1,0 +1,791 @@
+diff --git a/vllm/model_executor/layers/fused_moe/deep_gemm_moe.py b/vllm/model_executor/layers/fused_moe/deep_gemm_moe.py
+index 6a50e33b6..b0bc73487 100644
+--- a/vllm/model_executor/layers/fused_moe/deep_gemm_moe.py
++++ b/vllm/model_executor/layers/fused_moe/deep_gemm_moe.py
+@@ -111,6 +111,7 @@ def deep_gemm_grouped_gemm_masked(
+ def deep_gemm_prefill_moe(
+     hidden_states: torch.Tensor,
+     num_tokens_per_expert: torch.Tensor,
++    valid_indices: torch.Tensor,
+     w1: torch.Tensor,
+     w1_s: torch.Tensor,
+     w2: torch.Tensor,
+@@ -131,13 +132,14 @@ def deep_gemm_prefill_moe(
+                           dtype=hidden_states.dtype)
+ 
+     m_indices = get_m_indices(num_tokens_per_expert)
++    valid_indices = valid_indices.to(dtype=torch.int32)
+ 
+     deep_gemm_grouped_gemm_contiguous(
+         hidden_states,
+         w1,
+         w1_s,
+         intermediate_cache1,
+-        m_indices,
++        valid_indices,
+         block_k=block_k,
+     )
+ 
+@@ -153,7 +155,7 @@ def deep_gemm_prefill_moe(
+         w2,
+         w2_s,
+         output,
+-        m_indices,
++        valid_indices,
+         block_k=block_k,
+     )
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/layer.py b/vllm/model_executor/layers/fused_moe/layer.py
+index 9aea9a6f4..2033afb5a 100644
+--- a/vllm/model_executor/layers/fused_moe/layer.py
++++ b/vllm/model_executor/layers/fused_moe/layer.py
+@@ -22,6 +22,9 @@ from vllm.platforms import current_platform
+ from vllm.platforms.interface import CpuArchEnum
+ from vllm.utils import direct_register_custom_op
+ from vllm.model_executor.layers.fused_moe.expert_weight import ExpertWeightsPerLayer
++import triton
++import triton.language as tl
++import vllm._custom_ops as ops
+ 
+ if current_platform.is_cuda_alike():
+     from .fused_moe import fused_experts
+@@ -925,6 +928,299 @@ direct_register_custom_op(
+ )
+ 
+ 
++@triton.jit
++def grouped_gemm_triton_kernel(
++    a,
++    b,
++    c,
++    batch_size,
++    N,
++    K,
++    seg_indptr,
++    weight_indices,
++    m_num_tiles_indptr,
++    scale_a,
++    scale_b,
++    use_fp8_w8a8: tl.constexpr,
++    group_n: tl.constexpr,
++    group_k: tl.constexpr,
++    a_stride_0: tl.constexpr,
++    b_stride_0: tl.constexpr,
++    b_stride_1: tl.constexpr,
++    as_stride_0: tl.constexpr,
++    as_stride_1: tl.constexpr,
++    bs_stride_0: tl.constexpr,
++    bs_stride_2: tl.constexpr,
++    bs_stride_1: tl.constexpr,
++    BLOCK_SIZE_M: tl.constexpr,
++    BLOCK_SIZE_N: tl.constexpr,
++    BLOCK_SIZE_K: tl.constexpr,
++):
++    c_dtype = c.dtype.element_ty
++
++    pid_m = tl.program_id(0)
++    pid_n = tl.program_id(1)
++    total_m_block = tl.load(m_num_tiles_indptr + batch_size)
++    if pid_m >= total_m_block:
++        return
++
++    m_range_start, m_range_end, expert_id = compute_m_range(
++        pid_m, batch_size, seg_indptr, weight_indices, m_num_tiles_indptr, BLOCK_SIZE_M
++    )
++    if m_range_end - m_range_start == 0:
++        return
++
++    n_range_start = pid_n * BLOCK_SIZE_N
++    n_range_end = min(n_range_start + BLOCK_SIZE_N, N)
++
++    offs_am = tl.arange(0, BLOCK_SIZE_M)
++    offs_bn = tl.arange(0, BLOCK_SIZE_N)
++
++    offs_am = tl.where(offs_am < m_range_end - m_range_start, offs_am, 0)
++    offs_bn = tl.where(offs_bn < n_range_end - n_range_start, offs_bn, 0)
++    offs_am = tl.max_contiguous(tl.multiple_of(offs_am, BLOCK_SIZE_M), BLOCK_SIZE_M)
++    offs_bn = tl.max_contiguous(tl.multiple_of(offs_bn, BLOCK_SIZE_N), BLOCK_SIZE_N)
++    offs_k = tl.arange(0, BLOCK_SIZE_K)
++
++    a_ptr = a + (m_range_start + offs_am[:, None]) * a_stride_0 + offs_k[None, :]
++    b_ptr = b + (
++        (expert_id * b_stride_0)
++        + (n_range_start + offs_bn[:, None]) * b_stride_1
++        + offs_k[None, :]
++    )
++
++    if group_k > 0 and group_n > 0:
++        a_scale_ptrs = scale_a + (m_range_start + offs_am[:, None]) * as_stride_0
++        offs_bsn = (n_range_start + offs_bn) // group_n
++        b_scale_ptrs = scale_b + (expert_id * bs_stride_0) + offs_bsn * bs_stride_1
++
++    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
++    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
++        a_tile = tl.load(
++            a_ptr, mask=offs_k[None, :] < (K - k * BLOCK_SIZE_K), other=0.0
++        )
++        b_tile = tl.load(
++            b_ptr, mask=offs_k[None, :] < (K - k * BLOCK_SIZE_K), other=0.0
++        )
++
++        if group_k > 0 and group_n > 0:
++            k_start = k * BLOCK_SIZE_K
++            offs_ks = k_start // group_k
++            a_scale = tl.load(a_scale_ptrs + offs_ks * as_stride_1)
++            b_scale = tl.load(b_scale_ptrs + offs_ks * bs_stride_2)
++            accumulator += tl.dot(a_tile, b_tile.T) * a_scale * b_scale[None, :]
++        else:
++            accumulator = tl.dot(a_tile, b_tile.T, accumulator)
++        a_ptr += BLOCK_SIZE_K
++        b_ptr += BLOCK_SIZE_K
++
++    if use_fp8_w8a8 and not (group_k > 0 and group_n > 0):
++        scale_a_value = tl.load(scale_a + expert_id)
++        scale_b_value = tl.load(scale_b + expert_id)
++        accumulator *= scale_a_value * scale_b_value
++
++    c_tile = accumulator.to(c_dtype)
++
++    offs_cm = m_range_start + tl.arange(0, BLOCK_SIZE_M)
++    offs_cn = n_range_start + tl.arange(0, BLOCK_SIZE_N)
++    c_ptr = c + offs_cm[:, None] * N + offs_cn[None, :]
++    c_mask = (offs_cm[:, None] < m_range_end) & (offs_cn[None, :] < n_range_end)
++    tl.store(c_ptr, c_tile, mask=c_mask)
++
++
++@triton.jit
++def compute_m_num_tiles_indptr(
++    m_num_tiles_indptr, seg_indptr, batch_size: tl.constexpr, BLOCK_SIZE_M: tl.constexpr
++):
++    for bs in range(batch_size):
++        m = tl.load(seg_indptr + bs + 1) - tl.load(seg_indptr + bs)
++        cur_num_tiles = tl.cdiv(m, BLOCK_SIZE_M)
++        pre_num_tiles = tl.load(m_num_tiles_indptr + bs)
++        tl.store(m_num_tiles_indptr + bs + 1, pre_num_tiles + cur_num_tiles)
++
++
++def grouped_gemm_triton(
++    a: torch.Tensor,
++    b: torch.Tensor,
++    c: torch.Tensor,
++    batch_size: int,
++    weight_column_major: bool,
++    seg_indptr: Optional[torch.Tensor] = None,
++    weight_indices: Optional[torch.Tensor] = None,
++    use_fp8_w8a8: bool = False,
++    scale_a: torch.Tensor = None,
++    scale_b: torch.Tensor = None,
++    block_shape: Optional[List[int]] = None,
++):
++    assert weight_column_major == True  # TODO: more
++    if use_fp8_w8a8 and block_shape is None:
++        assert scale_a is not None and scale_b is not None
++
++    if block_shape is not None:
++        assert len(block_shape) == 2
++        block_n, block_k = block_shape[0], block_shape[1]
++        a, scale_a = ops.sglang_per_token_group_quant_fp8(a, block_k)
++
++        assert triton.cdiv(a.shape[-1], block_k) == scale_a.shape[-1]
++        assert triton.cdiv(b.shape[-2], block_n) == scale_b.shape[-2]
++        assert triton.cdiv(b.shape[-1], block_k) == scale_b.shape[-1]
++
++    # TODO: adjust config or tune kernel
++    # Reduce block size to prevent L40 shared memory overflow.
++    config = {
++        "BLOCK_SIZE_M": 64,
++        "BLOCK_SIZE_N": 32,
++        "BLOCK_SIZE_K": 128,
++    }
++
++    m_num_tiles_indptr = torch.zeros(batch_size + 1, device=a.device, dtype=torch.int64)
++    compute_m_num_tiles_indptr[(1,)](
++        m_num_tiles_indptr, seg_indptr, batch_size, config["BLOCK_SIZE_M"]
++    )
++
++    grid = lambda META: (
++        triton.cdiv(a.size(0), META["BLOCK_SIZE_M"]) + batch_size,
++        triton.cdiv(b.size(1), META["BLOCK_SIZE_N"]),
++    )
++
++    grouped_gemm_triton_kernel[grid](
++        a,
++        b,
++        c,
++        batch_size,
++        b.size(1),
++        b.size(2),
++        seg_indptr,
++        weight_indices,
++        m_num_tiles_indptr,
++        scale_a,
++        scale_b,
++        use_fp8_w8a8,
++        0 if block_shape is None else block_shape[0],
++        0 if block_shape is None else block_shape[1],
++        a.stride(0),
++        b.stride(0),
++        b.stride(1),
++        scale_a.stride(0) if scale_a is not None and scale_a.ndim == 2 else 0,
++        scale_a.stride(1) if scale_a is not None and scale_a.ndim == 2 else 0,
++        scale_b.stride(0) if scale_b is not None and scale_b.ndim >= 2 else 0,
++        scale_b.stride(2) if scale_b is not None and scale_b.ndim == 3 else 0,
++        scale_b.stride(1) if scale_b is not None and scale_b.ndim >= 2 else 0,
++        **config,
++    )
++    return c
++
++
++@triton.jit
++def silu_and_mul_triton_kernel(
++    gateup_output,
++    down_input,
++    hidden_size,
++    reorder_topk_ids,
++    scales,
++    start_expert_id,
++    end_expert_id,
++    BLOCK_SIZE: tl.constexpr,
++):
++    InDtype = gateup_output.dtype.element_ty
++    OutDtype = down_input.dtype.element_ty
++
++    half_hidden_size = hidden_size // 2
++
++    pid = tl.program_id(0)
++    expert_id = tl.load(reorder_topk_ids + pid)
++    if expert_id >= start_expert_id and expert_id <= end_expert_id:
++        gateup_output_ptr = gateup_output + pid * hidden_size
++        gate_output_ptr = gateup_output_ptr
++        up_output_ptr = gateup_output_ptr + half_hidden_size
++        down_input_ptr = down_input + pid * half_hidden_size
++
++        if scales is not None:
++            scale = tl.load(scales + expert_id - start_expert_id)
++            scale = (1 / scale).to(InDtype)
++        else:
++            scale = 1
++
++        for start_offset in tl.range(0, half_hidden_size, BLOCK_SIZE):
++            offset = start_offset + tl.arange(0, BLOCK_SIZE)
++            mask = offset < half_hidden_size
++
++            gate_output = tl.load(gate_output_ptr + offset, mask=mask).to(tl.float32)
++            up_output = tl.load(up_output_ptr + offset, mask=mask)
++
++            # silu & mul & quantize
++            gate_output = gate_output * tl.sigmoid(gate_output)
++            gate_output = gate_output.to(InDtype)
++
++            silu_mul_output = gate_output * up_output * scale
++            silu_mul_output = silu_mul_output.to(OutDtype)
++            tl.store(down_input_ptr + offset, silu_mul_output, mask=mask)
++
++
++class GroupedGemmRunner(torch.nn.Module):
++    flashinfer_gemm_warpper = None
++
++    def __init__(self, device, use_flashinfer: bool = False):
++        super().__init__()
++        self.device = device
++        self.use_flashinfer = use_flashinfer
++        if self.use_flashinfer and GroupedGemmRunner.flashinfer_gemm_warpper is None:
++            GroupedGemmRunner._init_flashinfer_wrapper(device)
++
++    @classmethod
++    def _init_flashinfer_wrapper(cls, device):
++        from flashinfer import SegmentGEMMWrapper
++
++        workspace_buffer = torch.empty(
++            128 * 1024 * 1024, dtype=torch.int8, device=device
++        )
++        cls.flashinfer_gemm_warpper = SegmentGEMMWrapper(workspace_buffer)
++
++    # c = a * b
++    def forward(
++        self,
++        a: torch.Tensor,
++        b: torch.Tensor,
++        c: torch.Tensor,
++        batch_size: int,
++        weight_column_major: bool,
++        seg_indptr: Optional[torch.Tensor] = None,
++        weight_indices: Optional[torch.Tensor] = None,
++        use_fp8_w8a8: bool = False,
++        scale_a: torch.Tensor = None,
++        scale_b: torch.Tensor = None,
++        block_shape: Optional[List[int]] = None,
++    ):
++        if self.use_flashinfer:
++            # TODO: flashinfer
++            assert False
++            assert GroupedGemmRunner.flashinfer_gemm_warpper is not None
++            c = GroupedGemmRunner.flashinfer_gemm_warpper.run(
++                x=a,
++                weights=b,
++                batch_size=batch_size,
++                weight_column_major=weight_column_major,
++                seg_indptr=seg_indptr,
++                weight_indices=weight_indices,
++            )
++        else:
++            assert weight_column_major == True
++            c = grouped_gemm_triton(
++                a,
++                b,
++                c,
++                batch_size,
++                weight_column_major,
++                seg_indptr,
++                weight_indices,
++                use_fp8_w8a8,
++                scale_a,
++                scale_b,
++                block_shape=block_shape,
++            )
++        return c
++
++
+ class DeepEPMoE(FusedMoE):
+     """
+     MoE Expert Parallel Impl based on DeepEP (https://github.com/deepseek-ai/DeepEP/tree/main)
+@@ -980,22 +1276,125 @@ class DeepEPMoE(FusedMoE):
+         self,
+         hidden_states: torch.Tensor,
+         tokens_per_expert: torch.Tensor,
++        valid_indices: Optional[torch.Tensor],
+         is_prefill: bool,
+     ):
+         if is_prefill:
+-            return self.forward_prefill(hidden_states, tokens_per_expert)
++            # return self.forward_prefill(hidden_states, tokens_per_expert, valid_indices)
++            return self.forward_normal_sglang(hidden_states, tokens_per_expert, valid_indices)
+         else:
+             return self.forward_decode(hidden_states, tokens_per_expert)
++        
++    def forward_normal_sglang(
++        self,
++        hidden_states: torch.Tensor,
++        reorder_topk_ids: torch.Tensor,
++        seg_indptr: torch.Tensor,
++    ):
++        assert self.quant_method is not None
++        assert self.activation == "silu"
++        if self.grouped_gemm_runner is None:
++            self.grouped_gemm_runner = GroupedGemmRunner(
++                hidden_states.device, use_flashinfer=False  # TODO: use flashinfer
++            )
++
++        if self.activation_scheme == "dynamic" and not self.quant_method.block_quant:
++            max_value = (
++                torch.max(hidden_states)
++                .repeat(self.local_num_experts)
++                .to(torch.float32)
++            )
++            self.w13_input_scale = max_value / torch.finfo(self.fp8_dtype).max
++        weight_indices_cur_rank = torch.arange(
++            0,
++            self.local_num_experts,
++            device=hidden_states.device,
++            dtype=torch.int64,
++        )
++
++        # GroupGemm-0
++        gateup_output = torch.empty(
++            hidden_states.shape[0],
++            self.w13_weight.shape[1],
++            device=hidden_states.device,
++            dtype=hidden_states.dtype,
++        )
++
++        if hidden_states.shape[0] > 0:
++            gateup_output = self.grouped_gemm_runner(
++                a=hidden_states,
++                b=self.w13_weight,
++                c=gateup_output,
++                batch_size=self.local_num_experts,
++                weight_column_major=True,
++                seg_indptr=seg_indptr,
++                weight_indices=weight_indices_cur_rank,
++                use_fp8_w8a8=True,
++                scale_a=self.w13_input_scale,
++                scale_b=self.w13_weight_scale_inv,
++                block_shape=self.quant_method.quant_config.weight_block_size,
++            )
++
++        # Act
++        down_input = torch.empty(
++            gateup_output.shape[0],
++            gateup_output.shape[1] // 2,
++            device=gateup_output.device,
++            dtype=hidden_states.dtype,
++        )
++        if self.w2_input_scale is None and not self.quant_method.block_quant:
++            self.w2_input_scale = torch.ones(
++                self.local_num_experts,
++                dtype=torch.float32,
++                device=hidden_states.device,
++            )
++
++        if self.activation == "silu":
++            silu_and_mul_triton_kernel[(gateup_output.shape[0],)](
++                gateup_output,
++                down_input,
++                gateup_output.shape[1],
++                reorder_topk_ids,
++                self.w2_input_scale,
++                0,
++                self.local_num_experts - 1,
++                BLOCK_SIZE=512,
++            )
++        else:
++            raise ValueError(f"Unsupported activation: {self.activation=}")
++
++        # GroupGemm-1
++        down_output = torch.empty(
++            down_input.shape[0],
++            self.w2_weight.shape[1],
++            device=hidden_states.device,
++            dtype=hidden_states.dtype,
++        )
++        if down_input.shape[0] > 0:
++            down_output = self.grouped_gemm_runner(
++                a=down_input,
++                b=self.w2_weight,
++                c=down_output,
++                batch_size=self.local_num_experts,
++                weight_column_major=True,
++                seg_indptr=seg_indptr,
++                weight_indices=weight_indices_cur_rank,
++                use_fp8_w8a8=True,
++                scale_a=self.w2_input_scale,
++                scale_b=self.w2_weight_scale_inv,
++                block_shape=self.quant_method.quant_config.weight_block_size,
++            )
++        return down_output
+ 
+     def forward_prefill(
+         self,
+         hidden_states: torch.Tensor,
+         tokens_per_expert: torch.Tensor,
++        valid_indices: Optional[torch.Tensor],
+     ):
+         from vllm.model_executor.layers.fused_moe.deep_gemm_moe import deep_gemm_prefill_moe
+ 
+         assert self.quant_method is not None and self.quant_method.block_quant, "DeepGEMM only support block quant."
+-
+         output = torch.empty(
+             hidden_states.shape[0],
+             self.w2_weight.shape[1],
+@@ -1007,13 +1406,14 @@ class DeepEPMoE(FusedMoE):
+             output = deep_gemm_prefill_moe(
+                 hidden_states,
+                 tokens_per_expert,
++                valid_indices,
+                 self.w13_weight,
+                 self.w13_weight_scale_inv,
+                 self.w2_weight,
+                 self.w2_weight_scale_inv,
+                 output,
+                 block_k=128,
+-                activation=self.activation,
++                activation=self.activation, 
+             )
+ 
+         return output
+diff --git a/vllm/model_executor/layers/fused_moe/token_dispatcher.py b/vllm/model_executor/layers/fused_moe/token_dispatcher.py
+index 189aba692..c29ac1492 100644
+--- a/vllm/model_executor/layers/fused_moe/token_dispatcher.py
++++ b/vllm/model_executor/layers/fused_moe/token_dispatcher.py
+@@ -111,9 +111,19 @@ def get_buffer_low_latency(
+     return _buffer_low_latency
+ 
+ 
++def get_m_indices(
++    num_tokens_per_expert: torch.Tensor,
++) -> torch.Tensor:
++    nonzero_expert_idxs = torch.nonzero(num_tokens_per_expert)
++    nonzero_expert_tokens = num_tokens_per_expert[nonzero_expert_idxs].view(-1)
++    m_indices = torch.repeat_interleave(nonzero_expert_idxs, nonzero_expert_tokens, dim=0).view(-1).to(dtype=torch.int32)
++    return m_indices
++
++
+ def permute(
+     tokens,
+     routing_map,
++    # tokens_per_expert: torch.Tensor = None,
+     num_out_tokens: Optional[int] = None,
+     fused: bool = False,
+     drop_and_pad: bool = False,
+@@ -142,6 +152,14 @@ def permute(
+         )
+         sorted_indices = token_indices.masked_select(routing_map)
+     permuted_input = tokens.index_select(0, sorted_indices)
++    # tokens_per_ex = get_m_indices(tokens_per_expert)
++    # tokens_per_2 = routing_map.sum(dim=1)
++    # print(tokens_per_ex)
++    # print(tokens_per_expert)
++    # print(tokens_per_2)
++    # assert tokens_per_2 == tokens_per_expert
++    # assert sorted_indices < 128, f"permuted_input value {permuted_input=}, {sorted_indices=}"
++    # assert permuted_input.shape[0] == sorted_indices.shape[0], f"hidden status {permuted_input.shape[0]} shape_0{sorted_indices.shape[0]} is not equal to sorted_indices."
+ 
+     return permuted_input, sorted_indices
+ 
+@@ -294,6 +312,8 @@ class DeepEPDispatcher:
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
+         self.hidden_shape = hidden_states.shape
+         topk_idx = topk_idx.to(torch.int64)
++        
++        # print(f"before dispatch: {hidden_states.shape=}, {topk_idx.shape=}, {topk_weights.shape=}")
+         if is_prefill:
+             (
+                 hidden_states,
+@@ -305,6 +325,8 @@ class DeepEPDispatcher:
+             ) = self.dispatch_normal(
+                 hidden_states, topk_idx, topk_weights, num_experts, previous_event
+             )
++            
++            # print(f"after dispatch: {hidden_states.shape=}, {topk_idx.shape=}, {topk_weights.shape=}, {num_recv_tokens_per_expert_list=}")
+             self.tokens_per_expert = torch.tensor(
+                 num_recv_tokens_per_expert_list,
+                 device=hidden_states.device,
+@@ -329,7 +351,7 @@ class DeepEPDispatcher:
+             if hidden_states.shape[0] > 0:
+                 hidden_states = self.get_permuted_hidden_states_by_experts(hidden_states)
+ 
+-        return hidden_states, topk_idx, topk_weights, tokens_per_expert
++        return hidden_states, topk_idx, topk_weights, tokens_per_expert, self.valid_indices
+ 
+     def dispatch_normal(
+         self,
+@@ -464,6 +486,7 @@ class DeepEPDispatcher:
+         combined_x, _, event = self.buffer_normal.combine(
+             x,
+             handle,
++            # self.topk_weights,#topk
+             async_finish=False,
+             previous_event=previous_event,
+             allocate_on_comm_stream=False,
+@@ -511,7 +534,7 @@ class DeepEPDispatcher:
+         )
+         multihot_routing_map[row_indices, valid_indices] = 1
+         multihot_probs[row_indices, valid_indices] = probs[mask]
+-        return multihot_routing_map.bool(), multihot_probs
++        return multihot_routing_map.bool(), multihot_probs, valid_indices
+ 
+     def get_dispached_metadata(self) -> torch.Tensor:
+         return self.topk_idx, self.topk_weights
+@@ -525,16 +548,19 @@ class DeepEPDispatcher:
+     def get_permuted_hidden_states_by_experts(
+         self, hidden_states: torch.Tensor
+     ) -> torch.Tensor:
+-        self.dispatched_routing_map, self.topk_weights = self._indices_to_multihot(
++        self.dispatched_routing_map, self.topk_weights, self.valid_indices = self._indices_to_multihot(
+             self.topk_idx, self.topk_weights
+         )
++        # print(f"after: _indices_to_multihot: {hidden_states.shape=}, {self.topk_weights=}, {self.dispatched_routing_map=}")
+         self.hidden_shape_before_permute = hidden_states.shape
+         hidden_states, self.reversed_mapping_for_combine = permute(
+             hidden_states,
+             self.dispatched_routing_map,
+             num_out_tokens=self.tokens_per_expert.sum(),
+             fused=self.permute_fusion,
++            # tokens_per_expert=self.tokens_per_expert,
+         )
++        # print(f"after: permute: {hidden_states.shape=}, {self.reversed_mapping_for_combine=}")
+         return hidden_states
+ 
+     def get_restored_hidden_states_by_experts(
+diff --git a/vllm/model_executor/models/deepseek_v2.py b/vllm/model_executor/models/deepseek_v2.py
+index 5d9ebaf80..bce62d91f 100644
+--- a/vllm/model_executor/models/deepseek_v2.py
++++ b/vllm/model_executor/models/deepseek_v2.py
+@@ -63,7 +63,17 @@ from .interfaces import SupportsPP
+ from .utils import (PPMissingLayer, is_pp_missing_parameter,
+                     make_empty_intermediate_tensors_factory, make_layers,
+                     maybe_prefix)
++import json, os
+ 
++class CustomData:
++    def __init__(self, tensor):
++        self.tensor = tensor
++
++def custom_serializer(obj):
++    if isinstance(obj, CustomData):
++        return {"tensor": obj.tensor.tolist()}
++    raise TypeError("Unsupported type")
++    
+ 
+ class DeepseekV2MLP(nn.Module):
+ 
+@@ -115,7 +125,8 @@ class DeepseekV2MoE(nn.Module):
+         self.routed_scaling_factor = config.routed_scaling_factor
+         self.n_shared_experts = config.n_shared_experts
+         self.parallel_config = parallel_config
+-        self.enable_deepep_moe = self.parallel_config.enable_deepep_moe 
++        self.enable_deepep_moe = self.parallel_config.enable_deepep_moe
++        self.counter = 0
+ 
+         if config.hidden_act != "silu":
+             raise ValueError(f"Unsupported activation: {config.hidden_act}. "
+@@ -226,10 +237,18 @@ class DeepseekV2MoE(nn.Module):
+             final_hidden_states = tensor_model_parallel_all_reduce(
+                 final_hidden_states)
+ 
++        # print(f"{final_hidden_states.shape=}: final_hidden_states: {final_hidden_states}")
+         return final_hidden_states.view(num_tokens, hidden_dim)
+ 
+     def forward_deepep(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         num_tokens, hidden_dim = hidden_states.shape
++        
++        debug = True
++        local_rank = torch.distributed.get_rank()
++
++        if debug:
++            print(f"{local_rank=}: {num_tokens=}, {hidden_dim=}, {self.top_k=}, {self.renormalize=}, {self.topk_group=}, {self.num_expert_group=}, {self.scoring_func=},")
++
+         hidden_states = hidden_states.view(-1, hidden_dim)
+         shared_output = None
+         topk_idx = torch.full(
+@@ -241,9 +260,14 @@ class DeepseekV2MoE(nn.Module):
+ 
+         # router_logits: (num_tokens, n_experts)
+         router_logits, _ = self.gate(hidden_states)
++
++        if debug:
++            print(f"{local_rank=}: {router_logits.shape=}")
++        
+         # random router in dummy run to work around dispatch unbalanced
+         if is_dummy_running():
+             router_logits = torch.randn_like(router_logits)
++            # print(f"{local_rank=}: dummy_run")
+         if self.n_shared_experts is not None:
+             shared_output = self.shared_experts(hidden_states)
+ 
+@@ -259,6 +283,9 @@ class DeepseekV2MoE(nn.Module):
+             e_score_correction_bias=self.gate.e_score_correction_bias,
+         )
+ 
++        if debug:
++            print(f"{local_rank=}: {topk_weights.shape=}, {topk_idx.shape=}")
++
+         # TODO modify by pd disaggregate, always run prefill mode now.
+         is_prefill = True
+ 
+@@ -277,7 +304,7 @@ class DeepseekV2MoE(nn.Module):
+             topk_idx = self.expert_weights_per_layer.dispatch_experts(topk_idx)
+ 
+         if self.dp_size > 1:
+-            recv_hidden_states, topk_idx, topk_weights, tokens_per_expert = (
++            recv_hidden_states, topk_idx, topk_weights, tokens_per_expert, valid_indices = (
+                 self.deepep_dispatcher.dispatch(
+                     hidden_states,
+                     topk_idx,
+@@ -287,23 +314,39 @@ class DeepseekV2MoE(nn.Module):
+                 )
+             )
+ 
++            if debug:
++                print(f"{local_rank=}: {recv_hidden_states.shape=}, {topk_idx.shape=}, {topk_weights.shape=}, {tokens_per_expert.shape=}, {valid_indices.shape=},")
++
++        # final_hidden_states = recv_hidden_states
+         final_hidden_states = (
+             self.experts(
+                 hidden_states=recv_hidden_states,
+                 tokens_per_expert=tokens_per_expert,
++                valid_indices=valid_indices,
+                 is_prefill=is_prefill,
+             )
+             * self.routed_scaling_factor
+         )
++
++        if debug:
++            print(f"{local_rank=}: {final_hidden_states.shape=}")
++
+         if self.dp_size > 1:
+             final_hidden_states = self.deepep_dispatcher.combine(
+                 final_hidden_states,
+                 is_prefill=is_prefill,
+             )
+ 
++            if debug:
++                print(f"{local_rank=}: after combine: {final_hidden_states.shape=}")
++
+         if shared_output is not None:
+             final_hidden_states = final_hidden_states + shared_output
+ 
++            if debug:
++                print(f"{local_rank=}: add share expert: {final_hidden_states.shape=}")
++
++        # print(f"{final_hidden_states.shape=}: final_hidden_states: {final_hidden_states}")
+         return final_hidden_states.view(num_tokens, hidden_dim)
+ 
+ 
+@@ -817,11 +860,12 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
+ 
+         from vllm.config import get_current_vllm_config
+         redundant_num_experts = get_current_vllm_config().parallel_config.redundant_num_experts
+-        self._initialize_expert_weight(
+-            self.config.num_hidden_layers, 
+-            self.config.n_routed_experts,
+-            redundant_num_experts
+-        )
++        if redundant_num_experts > 0:
++            self._initialize_expert_weight(
++                self.config.num_hidden_layers, 
++                self.config.n_routed_experts,
++                redundant_num_experts
++            )
+         
+ 
+     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+@@ -896,8 +940,8 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
+         for name, loaded_weight in weights:
+             if "rotary_emb.inv_freq" in name:
+                 continue
+-            # if name.startswith('model.layers.') and float(name[13:15]) > 4:
+-            #    continue
++            if name.startswith('model.layers.') and float(name[13:15]) > 4:
++               continue
+ 
+             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
+             if spec_layer is not None:
+@@ -972,7 +1016,7 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
+                     # except:
+                     #     pass
+             loaded_params.add(name)
+-        self._reload_experts()
++        # self._reload_experts()
+ 
+         return loaded_params
+ 
+@@ -991,10 +1035,11 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
+                         layer.mlp.experts.expert_weights_per_layer = ExpertWeightsPerLayer(i, self.expert_weight)
+ 
+     def rebalance_experts(self):
+-        # get new expert ids stored on each GPU
+-        self.expert_weight.rebalance()
+-        # reload follow self.expert_weight.expert_ids
+-        self._reload_experts()
++        pass
++        # # get new expert ids stored on each GPU
++        # self.expert_weight.rebalance()
++        # # reload follow self.expert_weight.expert_ids
++        # self._reload_experts()
+ 
+     def _reload_experts(self):
+         min_index = get_dp_group().rank * self.expert_weight.num_experts_local
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 69936c1cb..eb330d147 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -1056,7 +1056,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # this may be error . 
+         
+         if bypass_model_exec is False:
+-            logger.info("set_forward_context , bypass_model_exec : {}".format(bypass_model_exec))
++            # logger.info("set_forward_context , bypass_model_exec : {}".format(bypass_model_exec))
+         
+             with set_forward_context(attn_metadata, self.vllm_config):
+                 hidden_states = self.model(
